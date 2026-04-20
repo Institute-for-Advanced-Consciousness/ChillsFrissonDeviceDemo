@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
 ChillsDemo — GUI station for running chills / ASMR experiments
-with Frisson haptic-device integration.
+with direct Frisson haptic-device BLE control.
 
 Based on E4002 by the Institute for Advanced Consciousness.
 
 Launch:
-    python app.py
-
-The app automatically starts the WebSocket relay server (fr_server.py),
-connects to it, and guides you through device pairing, stimulus playback,
-chills capture, and data saving.
+    source venv/bin/activate && python app.py
 """
 
+import asyncio
 import contextlib
 import json
 import os
-import queue
 import random
 import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from datetime import datetime
 
 # ── Dependency checks ────────────────────────────────────────────────────
@@ -37,9 +32,9 @@ try:
 except ImportError:
     _missing.append("pygame")
 try:
-    import websocket  # websocket-client
+    from bleak import BleakClient, BleakScanner
 except ImportError:
-    _missing.append("websocket-client")
+    _missing.append("bleak")
 
 if _missing:
     print("Missing dependencies: " + ", ".join(_missing))
@@ -51,12 +46,7 @@ if _missing:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STIMULI_DIR = os.path.join(BASE_DIR, "Stimuli")
 DATA_DIR = os.path.join(BASE_DIR, "Data")
-SERVER_SCRIPT = os.path.join(BASE_DIR, "fr_server.py")
-WS_URL = "ws://localhost:8766"
-FRISSON_WEBAPP = "https://frissoniacs.github.io/"
 
-# Song definitions from E4002_RunExperiment.py
-# triggers = seconds into the track where the Frisson device fires
 SONGS = {
     "Arameic": {
         "file": "Arameic.mp3",
@@ -75,6 +65,29 @@ SONGS = {
     },
 }
 
+# ── Frisson BLE protocol ────────────────────────────────────────────────
+#
+# Service UUID for the RFduino-based Frisson device.
+FRISSON_SERVICE_UUID = "00002220-0000-1000-8000-00805f9b34fb"
+#
+# BLE packet format (13 bytes):
+#   [cmd, P1_str, P2_str, P3_str, M1_str,
+#    P1_start, P2_start, P3_start, M1_start,
+#    P1_stop,  P2_stop,  P3_stop,  M1_stop]
+# Times are in 0.1 s units (e.g., 30 = 3.0 seconds).
+#
+# Test packet: all 3 peltiers at max, simultaneous, 3 seconds.
+BLE_TEST_PACKET = bytes([20, 255, 255, 255, 0, 0, 0, 0, 0, 30, 30, 30, 0])
+#
+# Session trigger packet — cascading wave P3 → P2 → P1:
+#   P3 fires immediately  (start=0,  stop=30  → 0.0–3.0 s)
+#   P2 fires at +0.3 s    (start=3,  stop=33  → 0.3–3.3 s)
+#   P1 fires at +0.5 s    (start=5,  stop=35  → 0.5–3.5 s)
+# The BLE write is scheduled 0.25 s before the nominal trigger time,
+# so relative to the music: P3 @ T−0.25, P2 ≈ T, P1 @ T+0.25.
+BLE_SESSION_PACKET = bytes([20, 255, 255, 255, 0, 5, 3, 0, 0, 35, 33, 30, 0])
+TRIGGER_LEAD_TIME = 0.25  # send the packet this many seconds early
+
 # ── Colours ──────────────────────────────────────────────────────────────
 
 C_PRIMARY = "#e94560"
@@ -83,129 +96,263 @@ C_WARNING = "#f39c12"
 C_DANGER = "#e74c3c"
 C_MUTED = "#7f8c9b"
 C_ACCENT = "#0f3460"
-C_CARD = "#16213e"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Frisson WebSocket Client
+#  FrissonBLE — persistent direct BLE connection
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-class FrissonClient:
-    """Persistent, auto-reconnecting WebSocket connection to fr_server.py.
+class FrissonBLE:
+    """Manages a persistent BLE connection to the Frisson device.
 
-    Tracks three independent statuses by listening to messages relayed
-    through the server:
-
-    * **server_connected** – our WS link to fr_server.py is alive.
-    * **webapp_connected** – the Frisson browser page has sent
-      ``FW_Frisson_Hello`` through the server (page loaded + WS open).
-    * **device_verified** / **device_last_verified** – the webapp echoed
-      ``FW_Frisson_Trigger`` after a successful BLE write, proving the
-      physical device is paired and responsive.  Resets on WS disconnect.
+    All public methods are **blocking** and must be called from a
+    worker thread, never the main/tkinter thread.  The class runs
+    its own asyncio event loop in a background thread so that the
+    BleakClient's connection stays alive between calls.
     """
 
     def __init__(self):
-        self.ws: websocket.WebSocketApp | None = None
-        self.server_connected = False
-        self.webapp_connected = False      # got FW_Frisson_Hello
-        self.device_verified = False       # got FW_Frisson_Trigger
-        self.device_last_verified: float | None = None  # time.time()
-        self._client_count = 0
-        self._running = True
+        self.connected = False
+        self.device_name = ""
+        self.device_rssi: int | None = None
+        self.services_info: list[dict] = []   # populated on connect
+        self.notifications: list[dict] = []   # data received from device
+        self._client: BleakClient | None = None
+        self._write_uuid: str | None = None
+        self._write_response: bool = True  # use write-with-response by default
+        self._notify_uuid: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self.on_disconnect_callback = None    # set by the app
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def start(self):
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        """Spin up the background asyncio event loop."""
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True,
+        )
         self._thread.start()
 
     def stop(self):
-        self._running = False
-        if self.ws:
+        if self._loop and self._client:
             with contextlib.suppress(Exception):
-                self.ws.close()
+                asyncio.run_coroutine_threadsafe(
+                    self._safe_disconnect(), self._loop,
+                ).result(timeout=4)
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self.connected = False
 
-    # ── internal reconnect loop ──────────────────────────────────────
+    # ── blocking public API (call from worker threads) ────────────────
 
-    def _loop(self):
-        while self._running:
-            try:
-                self.ws = websocket.WebSocketApp(
-                    WS_URL,
-                    on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_close=self._on_close,
-                    on_error=self._on_error,
-                )
-                self.ws.run_forever(ping_interval=10, ping_timeout=5)
-            except Exception:
-                pass
-            self.server_connected = False
-            self.webapp_connected = False
-            self.device_verified = False
-            self._client_count = 0
-            if self._running:
-                time.sleep(2)
+    def connect(self) -> tuple[bool, str]:
+        return self._submit(self._do_connect())
 
-    # ── callbacks ────────────────────────────────────────────────────
+    def disconnect(self) -> tuple[bool, str]:
+        return self._submit(self._safe_disconnect())
 
-    def _on_open(self, ws):
-        self.server_connected = True
-        with contextlib.suppress(Exception):
-            ws.send("status")
+    def send(self, packet: bytes) -> tuple[bool, str]:
+        return self._submit(self._do_write(packet))
 
-    def _on_message(self, ws, message):
-        # ── plain-string messages relayed from the Frisson webapp ────
-        if message == "FW_Frisson_Hello":
-            self.webapp_connected = True
-            return
-        if message == "FW_Frisson_Trigger":
-            # The webapp confirmed a successful BLE write to the device.
-            self.webapp_connected = True  # also confirms webapp is alive
-            self.device_verified = True
-            self.device_last_verified = time.time()
-            return
+    def send_and_listen(self, packet: bytes, wait: float = 4.0) -> tuple[bool, str, list[bytes]]:
+        """Send a packet, then collect any notifications for *wait* seconds."""
+        return self._submit(self._do_write_and_listen(packet, wait), timeout=wait + 5)
 
-        # ── JSON status messages from our server ─────────────────────
+    def _submit(self, coro, timeout=15):
+        if not self._loop:
+            return False, "BLE not started"
         try:
-            data = json.loads(message)
-            if data.get("type") == "status":
-                count = data.get("clients", 1)
-                # 2+ clients = at least one other client besides us (the webapp)
-                if count >= 2:
-                    self.webapp_connected = True
-                elif self._client_count >= 2:
-                    # Count dropped — webapp disconnected
-                    self.webapp_connected = False
-                    self.device_verified = False
-                self._client_count = count
-        except (json.JSONDecodeError, TypeError):
-            pass
+            return asyncio.run_coroutine_threadsafe(
+                coro, self._loop,
+            ).result(timeout=timeout)
+        except Exception as exc:
+            return False, str(exc)[:80]
 
-    def _on_close(self, ws, status_code=None, msg=None):
-        self.server_connected = False
-        self.webapp_connected = False
-        self.device_verified = False
-        self._client_count = 0
+    # ── async internals ──────────────────────────────────────────────
 
-    def _on_error(self, ws, error):
-        pass  # reconnect loop handles it
+    async def _do_connect(self) -> tuple[bool, str]:
+        await self._safe_disconnect()
+        self.services_info = []
+        self.notifications = []
 
-    # ── public API ───────────────────────────────────────────────────
+        device = await BleakScanner.find_device_by_filter(
+            lambda _d, ad: FRISSON_SERVICE_UUID.lower()
+            in [s.lower() for s in (ad.service_uuids or [])],
+            timeout=6.0,
+        )
+        if not device:
+            return False, "Device not found — is it powered on?"
 
-    def trigger_device(self) -> bool:
-        if self.ws and self.server_connected:
+        self.device_rssi = getattr(device, "rssi", None)
+
+        self._client = BleakClient(
+            device, timeout=8.0,
+            disconnected_callback=self._on_disconnect,
+        )
+        await self._client.connect()
+
+        # ── enumerate every service & characteristic ────────────
+        frisson_chars = []  # ordered list for the target service
+        for svc in self._client.services:
+            svc_info = {
+                "uuid": svc.uuid,
+                "characteristics": [],
+            }
+            for ch in svc.characteristics:
+                ch_info = {
+                    "uuid": ch.uuid,
+                    "properties": list(ch.properties),
+                    "descriptors": [d.uuid for d in ch.descriptors],
+                }
+                svc_info["characteristics"].append(ch_info)
+
+                if svc.uuid.lower() == FRISSON_SERVICE_UUID.lower():
+                    frisson_chars.append(ch)
+                    if "notify" in ch.properties or "indicate" in ch.properties:
+                        self._notify_uuid = ch.uuid
+
+            self.services_info.append(svc_info)
+
+        # The webapp (sketch_rfduino.js) uses characteristics[1] as the
+        # write target.  Match that index so we hit the correct one.
+        if len(frisson_chars) >= 2:
+            target = frisson_chars[1]
+            self._write_uuid = target.uuid
+            self._write_response = "write" in target.properties
+        else:
+            # Fallback: pick any writable characteristic
+            for ch in frisson_chars:
+                if "write" in ch.properties or "write-without-response" in ch.properties:
+                    self._write_uuid = ch.uuid
+                    self._write_response = "write" in ch.properties
+                    break
+
+        if not self._write_uuid:
+            await self._client.disconnect()
+            return False, "Write characteristic not found"
+
+        # ── subscribe to ALL notify/indicate chars across all services
+        self._notify_uuids = []
+        for svc in self._client.services:
+            for ch in svc.characteristics:
+                if "notify" in ch.properties or "indicate" in ch.properties:
+                    try:
+                        await self._client.start_notify(ch.uuid, self._on_notify)
+                        self._notify_uuids.append(ch.uuid)
+                    except Exception:
+                        pass
+        if self._notify_uuids:
+            self._notify_uuid = self._notify_uuids[0]  # for status display
+
+        self.connected = True
+        self.device_name = device.name or "Frisson"
+        return True, self.device_name
+
+    def _on_notify(self, _sender, data: bytearray):
+        """Called by bleak whenever the device pushes a notification."""
+        self.notifications.append({
+            "time": time.time(),
+            "data": bytes(data),
+            "hex": data.hex(),
+        })
+
+    async def _do_write(self, packet: bytes) -> tuple[bool, str]:
+        if not self._client or not self._client.is_connected:
+            self.connected = False
+            return False, "Not connected"
+        try:
+            await self._client.write_gatt_char(
+                self._write_uuid, packet,
+                response=self._write_response,
+            )
+            return True, "OK"
+        except Exception as exc:
+            self.connected = False
+            return False, str(exc)[:80]
+
+    async def _read_all_chars(self) -> list[dict]:
+        """Read every readable characteristic and return their values."""
+        reads = []
+        for svc in self._client.services:
+            for ch in svc.characteristics:
+                if "read" in ch.properties:
+                    try:
+                        val = await self._client.read_gatt_char(ch.uuid)
+                        reads.append({
+                            "service": svc.uuid,
+                            "char": ch.uuid,
+                            "properties": list(ch.properties),
+                            "value": bytes(val),
+                            "hex": val.hex(" "),
+                            "text": val.decode("utf-8", errors="replace"),
+                        })
+                    except Exception as exc:
+                        reads.append({
+                            "service": svc.uuid,
+                            "char": ch.uuid,
+                            "properties": list(ch.properties),
+                            "error": str(exc)[:60],
+                        })
+        return reads
+
+    async def _do_write_and_listen(
+        self, packet: bytes, wait: float,
+    ) -> tuple[bool, str, list]:
+        """Write a packet, then read everything and collect notifications."""
+        if not self._client or not self._client.is_connected:
+            self.connected = False
+            return False, "Not connected", []
+        before = len(self.notifications)
+
+        # Read all chars BEFORE trigger
+        reads_before = await self._read_all_chars()
+
+        try:
+            await self._client.write_gatt_char(
+                self._write_uuid, packet,
+                response=self._write_response,
+            )
+        except Exception as exc:
+            self.connected = False
+            return False, str(exc)[:80], []
+
+        await asyncio.sleep(wait)
+
+        # Read all chars AFTER trigger
+        reads_after = await self._read_all_chars()
+
+        new_notifs = self.notifications[before:]
+        report = {
+            "notifications": [n["data"] for n in new_notifs],
+            "reads_before": reads_before,
+            "reads_after": reads_after,
+        }
+        return True, "OK", report
+
+    async def _safe_disconnect(self) -> tuple[bool, str]:
+        if self._client:
+            for uuid in getattr(self, "_notify_uuids", []):
+                with contextlib.suppress(Exception):
+                    await self._client.stop_notify(uuid)
             with contextlib.suppress(Exception):
-                self.ws.send("trigger_device")
-                return True
-        return False
+                if self._client.is_connected:
+                    await self._client.disconnect()
+        self.connected = False
+        self._write_uuid = None
+        self._write_response = True
+        self._notify_uuid = None
+        return True, "Disconnected"
 
-    def request_status(self):
-        if self.ws and self.server_connected:
-            with contextlib.suppress(Exception):
-                self.ws.send("status")
+    def _on_disconnect(self, _client):
+        """Called by bleak when the device disconnects unexpectedly."""
+        self.connected = False
+        self._write_uuid = None
+        self._notify_uuid = None
+        if self.on_disconnect_callback:
+            self.on_disconnect_callback()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -226,8 +373,7 @@ class ChillsDemoApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         # ── state ────────────────────────────────────────────────────
-        self.server_process: subprocess.Popen | None = None
-        self.frisson = FrissonClient()
+        self.ble = FrissonBLE()
         self.session_active = False
         self.chills_reports: list[dict] = []
         self.current_song: str | None = None
@@ -259,8 +405,8 @@ class ChillsDemoApp(ctk.CTk):
         self._build_status_bar()
 
         # ── services ─────────────────────────────────────────────────
-        self._start_server()
-        self.after(800, self.frisson.start)
+        self.ble.start()
+        self.ble.on_disconnect_callback = lambda: self.after(0, self._poll_status)
 
         # ── participant counter ──────────────────────────────────────
         self.participant_number = self._next_participant_number()
@@ -276,115 +422,37 @@ class ChillsDemoApp(ctk.CTk):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _build_status_bar(self):
-        self.status_bar.grid_columnconfigure(4, weight=1)
-        pad = {"padx": (16, 18), "pady": 10}
+        self.status_bar.grid_columnconfigure(2, weight=1)
 
-        self.lbl_server = ctk.CTkLabel(
-            self.status_bar, text="Server: --", font=("Helvetica", 12)
+        self.lbl_ble = ctk.CTkLabel(
+            self.status_bar, text="Device: not connected",
+            font=("Helvetica", 12),
         )
-        self.lbl_server.grid(row=0, column=0, **pad)
+        self.lbl_ble.grid(row=0, column=0, padx=(16, 20), pady=10)
 
-        self.lbl_webapp = ctk.CTkLabel(
-            self.status_bar, text="Webapp: --", font=("Helvetica", 12)
-        )
-        self.lbl_webapp.grid(row=0, column=1, **pad)
-
-        self.lbl_device = ctk.CTkLabel(
-            self.status_bar, text="Device: --", font=("Helvetica", 12)
-        )
-        self.lbl_device.grid(row=0, column=2, **pad)
-
-        # right-aligned session counter
         self.lbl_sessions = ctk.CTkLabel(
-            self.status_bar, text="Sessions saved: 0", font=("Helvetica", 12),
-            text_color=C_MUTED,
+            self.status_bar, text="Sessions saved: 0",
+            font=("Helvetica", 12), text_color=C_MUTED,
         )
-        self.lbl_sessions.grid(row=0, column=5, padx=(0, 16), pady=10)
+        self.lbl_sessions.grid(row=0, column=3, padx=(0, 16), pady=10)
 
     def _poll_status(self):
-        """Called every 2 s to refresh the three status-bar indicators."""
-
-        # ── 1. Server (our WebSocket link to fr_server.py) ───────────
-        if self.frisson.server_connected:
-            self.lbl_server.configure(text="Server: Running", text_color=C_SUCCESS)
+        # BLE connection
+        if self.ble.connected:
+            self.lbl_ble.configure(
+                text=f"Device: {self.ble.device_name}", text_color=C_SUCCESS)
         else:
-            self.lbl_server.configure(text="Server: Waiting...", text_color=C_WARNING)
+            self.lbl_ble.configure(
+                text="Device: not connected", text_color=C_DANGER)
 
-        # ── 2. Webapp (Frisson browser page connected via WS) ────────
-        if self.frisson.webapp_connected:
-            self.lbl_webapp.configure(text="Webapp: Connected", text_color=C_SUCCESS)
-        elif self.frisson.server_connected:
-            self.lbl_webapp.configure(text="Webapp: Not connected", text_color=C_WARNING)
-        else:
-            self.lbl_webapp.configure(text="Webapp: --", text_color=C_MUTED)
-
-        # ── 3. Device (BLE-verified via FW_Frisson_Trigger echo) ─────
-        if self.frisson.device_verified:
-            age = ""
-            if self.frisson.device_last_verified:
-                secs = int(time.time() - self.frisson.device_last_verified)
-                if secs < 60:
-                    age = f" ({secs}s ago)"
-                else:
-                    age = f" ({secs // 60}m ago)"
-            self.lbl_device.configure(
-                text=f"Device: Verified{age}", text_color=C_SUCCESS)
-        elif self.frisson.webapp_connected:
-            self.lbl_device.configure(
-                text="Device: Not tested — press Test Trigger",
-                text_color=C_WARNING)
-        else:
-            self.lbl_device.configure(text="Device: --", text_color=C_MUTED)
-
-        # ── session file count ───────────────────────────────────────
+        # session count
         try:
             n = len([f for f in os.listdir(DATA_DIR) if f.endswith(".json")])
         except OSError:
             n = 0
         self.lbl_sessions.configure(text=f"Sessions saved: {n}")
 
-        # ask server for fresh client counts
-        self.frisson.request_status()
-
         self.after(2000, self._poll_status)
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #  Server Management
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def _start_server(self):
-        if self.server_process and self.server_process.poll() is None:
-            return
-        # Kill any orphaned server still holding the port from a prior run
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                ["lsof", "-ti", "tcp:8766"],
-                capture_output=True, text=True, timeout=3,
-            )
-            result = subprocess.run(
-                ["lsof", "-ti", "tcp:8766"],
-                capture_output=True, text=True, timeout=3,
-            )
-            for pid in result.stdout.strip().split("\n"):
-                if pid.strip():
-                    subprocess.run(["kill", pid.strip()], timeout=3)
-            time.sleep(0.3)
-        try:
-            self.server_process = subprocess.Popen(
-                [sys.executable, SERVER_SCRIPT],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-        except Exception as exc:
-            print(f"[App] Failed to start server: {exc}")
-
-    def _stop_server(self):
-        if self.server_process:
-            self.server_process.terminate()
-            try:
-                self.server_process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.server_process.kill()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  Helpers
@@ -413,33 +481,37 @@ class ChillsDemoApp(ctk.CTk):
         s = max(0, int(seconds))
         return f"{s // 60}:{s % 60:02d}"
 
+    def _worker(self, fn, on_done):
+        """Run *fn* in a background thread; call on_done(result) on
+        the main thread when it finishes."""
+        def _run():
+            result = fn()
+            self.after(0, lambda: on_done(result))
+        threading.Thread(target=_run, daemon=True).start()
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #  PAGE 1 — Connection Setup
+    #  PAGE 1 — Device Connection
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def show_connection_page(self):
         self._clear_page()
 
-        # title
         ctk.CTkLabel(
             self.page_frame, text="Chills Demo Station",
             font=("Helvetica", 34, "bold"),
         ).pack(pady=(30, 2))
         ctk.CTkLabel(
-            self.page_frame, text="Device Connection Setup",
+            self.page_frame, text="Device Connection",
             font=("Helvetica", 16), text_color=C_MUTED,
-        ).pack(pady=(0, 25))
+        ).pack(pady=(0, 30))
 
         # instructions card
         card = ctk.CTkFrame(self.page_frame, corner_radius=12)
         card.pack(fill="x", padx=50, pady=10)
-
         steps = [
-            "The WebSocket relay server starts automatically in the background.",
-            "Click 'Open Frisson Webapp' to launch it in your browser.",
-            "In the webapp: tap Connect, select your Frisson device, and pair it.",
-            "Set all intensity sliders (P1, P2, P3) to maximum (255).",
-            "Click 'Test Trigger' — Device status turns green when the hardware responds.",
+            "Power on the Frisson device.",
+            "Click 'Scan & Connect' — the app pairs directly over Bluetooth.",
+            "Click 'Test Trigger' to fire all 3 peltiers at full strength for 3 s.",
         ]
         for i, text in enumerate(steps):
             row = ctk.CTkFrame(card, fg_color="transparent")
@@ -453,32 +525,49 @@ class ChillsDemoApp(ctk.CTk):
                 wraplength=620, anchor="w", justify="left",
             ).pack(side="left", padx=(6, 0))
 
-        # action buttons
-        btn_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
-        btn_row.pack(pady=20)
+        # connection status / diagnostic output
+        self._conn_status = ctk.CTkLabel(
+            self.page_frame, text="Not connected",
+            font=("Courier", 12), text_color=C_MUTED,
+            wraplength=700, justify="left", anchor="w",
+        )
+        self._conn_status.pack(pady=(20, 12), fill="x", padx=50)
 
-        ctk.CTkButton(
-            btn_row, text="Open Frisson Webapp",
-            font=("Helvetica", 15, "bold"), width=230, height=44,
+        # buttons
+        btn_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
+        btn_row.pack(pady=8)
+
+        self._connect_btn = ctk.CTkButton(
+            btn_row, text="Scan & Connect",
+            font=("Helvetica", 15, "bold"), width=200, height=44,
             fg_color=C_ACCENT, hover_color="#1a4a7a",
-            command=lambda: webbrowser.open(FRISSON_WEBAPP),
-        ).pack(side="left", padx=10)
+            command=self._on_connect,
+        )
+        self._connect_btn.pack(side="left", padx=8)
+
+        self._disconnect_btn = ctk.CTkButton(
+            btn_row, text="Disconnect",
+            font=("Helvetica", 15, "bold"), width=140, height=44,
+            fg_color="#2d3a4a", hover_color="#3d4a5a",
+            command=self._on_disconnect,
+        )
+        self._disconnect_btn.pack(side="left", padx=8)
 
         self._test_btn = ctk.CTkButton(
             btn_row, text="Test Trigger",
             font=("Helvetica", 15, "bold"), width=160, height=44,
             fg_color="#2d3a4a", hover_color="#3d4a5a",
-            command=self._test_trigger,
+            command=self._on_test,
         )
-        self._test_btn.pack(side="left", padx=10)
+        self._test_btn.pack(side="left", padx=8)
 
-        # skip-device option
+        # skip device
         self._skip_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             self.page_frame, text="Run without Frisson device",
             variable=self._skip_var, font=("Helvetica", 13),
             text_color=C_MUTED,
-        ).pack(pady=(8, 18))
+        ).pack(pady=(14, 18))
 
         # continue
         ctk.CTkButton(
@@ -488,36 +577,105 @@ class ChillsDemoApp(ctk.CTk):
             command=self._go_to_setup,
         ).pack(pady=5)
 
-    def _test_trigger(self):
-        # Clear previous verification so we can detect a fresh echo
-        prev_verified = self.frisson.device_verified
-        self.frisson.device_verified = False
-        sent = self.frisson.trigger_device()
-        if not sent:
-            self.frisson.device_verified = prev_verified  # restore
-            self._test_btn.configure(text="Send failed", fg_color=C_DANGER)
+        # sync status label with current state
+        if self.ble.connected:
+            self._conn_status.configure(
+                text=f"Connected to {self.ble.device_name}",
+                text_color=C_SUCCESS)
+
+    # ── connection actions ───────────────────────────────────────────
+
+    def _on_connect(self):
+        self._connect_btn.configure(text="Scanning...", fg_color=C_WARNING)
+        self._conn_status.configure(text="Scanning for Frisson device...", text_color=C_WARNING)
+        self._worker(self.ble.connect, self._connect_done)
+
+    def _connect_done(self, result):
+        ok, msg = result
+        if ok:
+            self._connect_btn.configure(text="Connected", fg_color=C_SUCCESS)
+            # Build a rich status string
+            parts = [f"Connected to {msg}"]
+            if self.ble.device_rssi is not None:
+                parts.append(f"RSSI: {self.ble.device_rssi} dBm")
+            wr_mode = "w/ response" if self.ble._write_response else "no response"
+            parts.append(f"Write: {wr_mode}")
+            notify_status = "yes" if self.ble._notify_uuid else "no"
+            parts.append(f"Notify: {notify_status}")
+            n_svc = len(self.ble.services_info)
+            n_chars = sum(len(s["characteristics"]) for s in self.ble.services_info)
+            parts.append(f"Services: {n_svc}, Chars: {n_chars}")
+            self._conn_status.configure(
+                text="  |  ".join(parts), text_color=C_SUCCESS)
+            self.after(2000, lambda: self._connect_btn.configure(
+                text="Scan & Connect", fg_color=C_ACCENT))
+        else:
+            self._connect_btn.configure(text="Retry", fg_color=C_DANGER)
+            self._conn_status.configure(text=msg, text_color=C_DANGER)
+            self.after(2000, lambda: self._connect_btn.configure(
+                text="Scan & Connect", fg_color=C_ACCENT))
+
+    def _on_disconnect(self):
+        self._worker(self.ble.disconnect, self._disconnect_done)
+
+    def _disconnect_done(self, _result):
+        self._conn_status.configure(text="Disconnected", text_color=C_MUTED)
+
+    def _on_test(self):
+        if not self.ble.connected:
+            self._test_btn.configure(text="Not connected", fg_color=C_DANGER)
             self.after(1500, lambda: self._test_btn.configure(
                 text="Test Trigger", fg_color="#2d3a4a"))
             return
-        self._test_btn.configure(text="Sent...", fg_color=C_WARNING)
-        # Check for FW_Frisson_Trigger echo over the next 3 seconds
-        self._test_trigger_check(attempts=6)
+        self._test_btn.configure(text="Firing (listening 4 s)...", fg_color=C_WARNING)
+        self._worker(
+            lambda: self.ble.send_and_listen(BLE_TEST_PACKET, wait=4.0),
+            self._test_done,
+        )
 
-    def _test_trigger_check(self, attempts: int):
-        if self.frisson.device_verified:
+    def _test_done(self, result):
+        ok, msg, report = result
+        if ok:
             self._test_btn.configure(text="Device OK!", fg_color=C_SUCCESS)
-            self.after(2000, lambda: self._test_btn.configure(
-                text="Test Trigger", fg_color="#2d3a4a"))
-            return
-        if attempts <= 0:
-            # Trigger was sent to server but no BLE confirmation came back.
-            # Device may not be paired, or webapp didn't relay the echo.
-            self._test_btn.configure(
-                text="Sent (no device echo)", fg_color=C_WARNING)
-            self.after(2500, lambda: self._test_btn.configure(
-                text="Test Trigger", fg_color="#2d3a4a"))
-            return
-        self.after(500, lambda: self._test_trigger_check(attempts - 1))
+            lines = ["Write succeeded."]
+
+            notifs = report.get("notifications", [])
+            if notifs:
+                lines.append(f"\nNotifications ({len(notifs)}):")
+                for raw in notifs:
+                    lines.append(f"  [{len(raw)}B] {raw.hex(' ')}")
+            else:
+                n_sub = len(getattr(self.ble, "_notify_uuids", []))
+                lines.append(f"No notifications (subscribed to {n_sub} char(s))")
+
+            reads_after = report.get("reads_after", [])
+            if reads_after:
+                lines.append(f"\nReadable characteristics ({len(reads_after)}):")
+                for r in reads_after:
+                    if "error" in r:
+                        lines.append(f"  {r['char'][:8]}.. err: {r['error']}")
+                    else:
+                        val_repr = r["text"] if r["value"].isascii() and len(r["value"]) < 30 else r["hex"]
+                        lines.append(f"  {r['char'][:8]}.. [{len(r['value'])}B] {val_repr}")
+
+            # Check if any readable values changed after the trigger
+            reads_before = report.get("reads_before", [])
+            changed = []
+            before_map = {r["char"]: r.get("hex", "") for r in reads_before}
+            for r in reads_after:
+                if r.get("hex", "") != before_map.get(r["char"], ""):
+                    changed.append(r["char"][:8])
+            if changed:
+                lines.append(f"\nChanged after trigger: {', '.join(changed)}")
+
+            self._conn_status.configure(
+                text="\n".join(lines), text_color=C_SUCCESS)
+        else:
+            self._test_btn.configure(text="Failed", fg_color=C_DANGER)
+            self._conn_status.configure(
+                text=f"Trigger failed: {msg}", text_color=C_DANGER)
+        self.after(4000, lambda: self._test_btn.configure(
+            text="Test Trigger", fg_color="#2d3a4a"))
 
     def _go_to_setup(self):
         self.use_device = not self._skip_var.get()
@@ -541,7 +699,9 @@ class ChillsDemoApp(ctk.CTk):
         ctk.CTkLabel(
             p_row, text="Participant #:", font=("Helvetica", 16),
         ).pack(side="left", padx=(0, 10))
-        self._p_entry = ctk.CTkEntry(p_row, width=80, font=("Helvetica", 16), justify="center")
+        self._p_entry = ctk.CTkEntry(
+            p_row, width=80, font=("Helvetica", 16), justify="center",
+        )
         self._p_entry.insert(0, str(self.participant_number))
         self._p_entry.pack(side="left")
 
@@ -567,6 +727,13 @@ class ChillsDemoApp(ctk.CTk):
         self._audio_lbl.pack(pady=(18, 0))
         self._check_audio()
 
+        # device warning if not connected
+        if self.use_device and not self.ble.connected:
+            ctk.CTkLabel(
+                self.page_frame, text="Device not connected — go back to connect or check 'run without'",
+                font=("Helvetica", 12), text_color=C_WARNING,
+            ).pack(pady=(6, 0))
+
         # start
         ctk.CTkButton(
             self.page_frame, text="Start Session",
@@ -591,32 +758,29 @@ class ChillsDemoApp(ctk.CTk):
         if missing:
             self._audio_lbl.configure(
                 text=f"Missing in Stimuli/: {', '.join(missing)}",
-                text_color=C_WARNING,
-            )
+                text_color=C_WARNING)
         else:
-            self._audio_lbl.configure(text="All audio files found", text_color=C_SUCCESS)
+            self._audio_lbl.configure(
+                text="All audio files found", text_color=C_SUCCESS)
 
     def _prepare_session(self):
-        # validate participant #
         try:
             self.participant_number = int(self._p_entry.get())
         except ValueError:
             self._p_entry.configure(border_color=C_DANGER)
             return
 
-        # pick song
         choice = self._song_var.get()
         self.current_song = (
             random.choice(list(SONGS.keys())) if choice == "Random" else choice
         )
 
-        # check file exists
         cfg = SONGS[self.current_song]
         path = os.path.join(STIMULI_DIR, cfg["file"])
         if not os.path.exists(path):
             self._audio_lbl.configure(
-                text=f"File not found: Stimuli/{cfg['file']}", text_color=C_DANGER,
-            )
+                text=f"File not found: Stimuli/{cfg['file']}",
+                text_color=C_DANGER)
             return
 
         self.song_duration = cfg["duration_est"]
@@ -629,7 +793,6 @@ class ChillsDemoApp(ctk.CTk):
     def show_session_page(self):
         self._clear_page()
 
-        # reset per-session state
         self.chills_reports = []
         self.device_triggers_fired = []
         self.session_active = True
@@ -645,7 +808,7 @@ class ChillsDemoApp(ctk.CTk):
             font=("Helvetica", 14), text_color=C_MUTED,
         ).pack(pady=(0, 28))
 
-        # device indicator (only when using device)
+        # BLE status dot (during session)
         if self.use_device:
             self._device_dot = ctk.CTkLabel(
                 self.page_frame, text="", font=("Helvetica", 12),
@@ -686,7 +849,6 @@ class ChillsDemoApp(ctk.CTk):
         )
         self._instr_lbl.pack(pady=(0, 30))
 
-        # stop
         ctk.CTkButton(
             self.page_frame, text="Stop Session",
             font=("Helvetica", 14, "bold"), width=160, height=40,
@@ -694,27 +856,21 @@ class ChillsDemoApp(ctk.CTk):
             command=self._abort_session,
         ).pack()
 
-        # key capture
         self._key_bind_id = self.bind("<KeyPress>", self._on_key)
-
-        # start audio
         self._start_playback()
 
-    # ── device dot (on session page) ─────────────────────────────────
+    # ── device dot ───────────────────────────────────────────────────
 
     def _refresh_device_dot(self):
         if not self.session_active:
             return
-        if self.frisson.device_verified:
+        if self.ble.connected:
             self._device_dot.configure(
-                text="Device: verified", text_color=C_SUCCESS)
-        elif self.frisson.webapp_connected:
-            self._device_dot.configure(
-                text="Device: webapp connected, BLE not yet verified",
-                text_color=C_WARNING)
+                text=f"Device: {self.ble.device_name}",
+                text_color=C_SUCCESS)
         else:
             self._device_dot.configure(
-                text="Device: NOT connected — check Frisson webapp & re-pair",
+                text="Device: DISCONNECTED — reconnect after session",
                 text_color=C_DANGER)
         self.after(3000, self._refresh_device_dot)
 
@@ -733,15 +889,15 @@ class ChillsDemoApp(ctk.CTk):
 
         self.playback_start = time.time()
 
-        # schedule device triggers
-        if self.use_device:
+        # Schedule BLE triggers with the cascade lead-time.
+        if self.use_device and self.ble.connected:
             for t in cfg["triggers"]:
-                timer = threading.Timer(t, self._fire_trigger, args=[t])
+                fire_at = max(0.0, t - TRIGGER_LEAD_TIME)
+                timer = threading.Timer(fire_at, self._fire_trigger, args=[t])
                 timer.daemon = True
                 timer.start()
                 self.trigger_timers.append(timer)
 
-        # start progress loop
         self._tick_session()
 
     # ── key handler ──────────────────────────────────────────────────
@@ -767,17 +923,18 @@ class ChillsDemoApp(ctk.CTk):
             "key": event.keysym,
         })
 
-        # flash counter
         n = len(self.chills_reports)
         self._chills_lbl.configure(text=str(n), text_color=C_PRIMARY)
-        self.after(180, lambda: self._chills_lbl.configure(text_color=("gray90", "gray90")))
+        self.after(180, lambda: self._chills_lbl.configure(
+            text_color=("gray90", "gray90")))
 
-    # ── trigger ──────────────────────────────────────────────────────
+    # ── trigger via direct BLE ───────────────────────────────────────
 
     def _fire_trigger(self, planned: float):
+        """Called from a Timer thread at each trigger point."""
         if not self.session_active:
             return
-        ok = self.frisson.trigger_device()
+        ok, _msg = self.ble.send(BLE_SESSION_PACKET)
         actual = (time.time() - self.playback_start) if self.playback_start else planned
         self.device_triggers_fired.append({
             "planned_sec": planned,
@@ -791,9 +948,7 @@ class ChillsDemoApp(ctk.CTk):
         if not self.session_active:
             return
 
-        # check if music finished
         if not pygame.mixer.music.get_busy() and self.playback_start is not None:
-            # small grace period so final notes aren't cut off
             elapsed = time.time() - self.playback_start
             if elapsed > 5:
                 self._end_session()
@@ -814,12 +969,10 @@ class ChillsDemoApp(ctk.CTk):
             return
         self.session_active = False
 
-        # unbind keys
         if self._key_bind_id:
             self.unbind("<KeyPress>", self._key_bind_id)
             self._key_bind_id = None
 
-        # cancel timers
         for t in self.trigger_timers:
             t.cancel()
         self.trigger_timers.clear()
@@ -853,7 +1006,6 @@ class ChillsDemoApp(ctk.CTk):
         # summary card
         card = ctk.CTkFrame(self.page_frame, corner_radius=10)
         card.pack(fill="x", padx=80, pady=8)
-
         for lbl, val in [
             ("Song", self.current_song),
             ("Duration", self._fmt(elapsed)),
@@ -873,7 +1025,6 @@ class ChillsDemoApp(ctk.CTk):
         q = ctk.CTkFrame(self.page_frame, fg_color="transparent")
         q.pack(fill="x", padx=80, pady=(18, 0))
 
-        # Q1 — experienced chills?
         ctk.CTkLabel(
             q, text="Did you experience chills?", font=("Helvetica", 16),
         ).pack(pady=(8, 8))
@@ -889,7 +1040,6 @@ class ChillsDemoApp(ctk.CTk):
             font=("Helvetica", 14),
         ).pack(side="left", padx=16)
 
-        # Q2 — intensity
         ctk.CTkLabel(
             q, text="How intense were the chills?  (1 = mild, 10 = very intense)",
             font=("Helvetica", 16),
@@ -897,21 +1047,22 @@ class ChillsDemoApp(ctk.CTk):
 
         sl_row = ctk.CTkFrame(q, fg_color="transparent")
         sl_row.pack()
-        ctk.CTkLabel(sl_row, text="1", font=("Helvetica", 12), text_color=C_MUTED).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(sl_row, text="1", font=("Helvetica", 12),
+                     text_color=C_MUTED).pack(side="left", padx=(0, 6))
         self._intensity_var = ctk.DoubleVar(value=5)
         ctk.CTkSlider(
             sl_row, from_=1, to=10, number_of_steps=9,
             variable=self._intensity_var, width=320,
             command=self._update_intensity_lbl,
         ).pack(side="left")
-        ctk.CTkLabel(sl_row, text="10", font=("Helvetica", 12), text_color=C_MUTED).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(sl_row, text="10", font=("Helvetica", 12),
+                     text_color=C_MUTED).pack(side="left", padx=(6, 0))
 
         self._int_lbl = ctk.CTkLabel(
             q, text="5", font=("Helvetica", 24, "bold"), text_color=C_PRIMARY,
         )
         self._int_lbl.pack(pady=4)
 
-        # save
         ctk.CTkButton(
             self.page_frame, text="Save & Next Participant",
             font=("Helvetica", 17, "bold"), width=300, height=52,
@@ -956,7 +1107,6 @@ class ChillsDemoApp(ctk.CTk):
         except OSError as exc:
             print(f"[App] Save error: {exc}")
 
-        # advance
         self.participant_number += 1
         self.show_setup_page()
 
@@ -965,7 +1115,6 @@ class ChillsDemoApp(ctk.CTk):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _on_close(self):
-        # if a session is in-flight, auto-save what we have
         if self.session_active and self.playback_start:
             self.session_active = False
             with contextlib.suppress(Exception):
@@ -974,14 +1123,12 @@ class ChillsDemoApp(ctk.CTk):
 
         for t in self.trigger_timers:
             t.cancel()
-        self.frisson.stop()
-        self._stop_server()
+        self.ble.stop()
         with contextlib.suppress(Exception):
             pygame.mixer.quit()
         self.destroy()
 
     def _emergency_save(self):
-        """Best-effort save of partial session data on unexpected close."""
         elapsed = (time.time() - self.playback_start) if self.playback_start else 0
         data = {
             "session_id": f"PARTIAL_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_P{self.participant_number:03d}",
