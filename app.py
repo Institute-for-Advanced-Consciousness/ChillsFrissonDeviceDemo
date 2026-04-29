@@ -16,6 +16,7 @@ Launch:
 import array
 import asyncio
 import contextlib
+import csv
 import json
 import math
 import os
@@ -42,6 +43,10 @@ try:
     from bleak import BleakClient, BleakScanner
 except ImportError:
     _missing.append("bleak")
+try:
+    import websockets
+except ImportError:
+    _missing.append("websockets")
 
 if _missing:
     print("Missing dependencies: " + ", ".join(_missing))
@@ -81,6 +86,14 @@ FRISSON_SERVICE_UUID = "00002220-0000-1000-8000-00805f9b34fb"
 BLE_TEST_PACKET = bytes([20, 255, 255, 255, 0, 0, 0, 0, 0, 30, 30, 30, 0])
 BLE_SESSION_PACKET = bytes([20, 255, 255, 255, 0, 5, 3, 0, 0, 35, 33, 30, 0])
 TRIGGER_LEAD_TIME = 0.25
+
+# ── ArcTop EEG (Suuvi mode) ─────────────────────────────────────────────
+
+ARCTOP_HEADPHONES_NAME = "MW75 Neuro"
+ARCTOP_WS_URL = (
+    "wss://hegemon42.arctop.com/proxy/65c3bbbb/arctop-api/ws"
+    "?token=90f698091d3382098ce6998c47d2632e6c5dcf54caa083983f8f6b39c084d146"
+)
 
 # ── Colours ──────────────────────────────────────────────────────────────
 
@@ -367,6 +380,264 @@ class FrissonBLE:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ArcTop EEG — environment checks + WebSocket recorder
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _check_mw75_bluetooth() -> tuple[bool, bool, str]:
+    """Look for the MW75 Neuro in macOS's Bluetooth listing.
+
+    Returns (paired, connected, status_text).
+    """
+    try:
+        r = subprocess.run(
+            ["system_profiler", "SPBluetoothDataType", "-json"],
+            capture_output=True, text=True, timeout=8,
+        )
+        data = json.loads(r.stdout or "{}")
+    except Exception as exc:
+        return False, False, f"BT query failed: {str(exc)[:60]}"
+
+    target = ARCTOP_HEADPHONES_NAME.lower()
+
+    def _find(devices):
+        if not isinstance(devices, list):
+            return None
+        for entry in devices:
+            if not isinstance(entry, dict):
+                continue
+            for name in entry.keys():
+                if isinstance(name, str) and target in name.lower():
+                    return name
+        return None
+
+    for block in data.get("SPBluetoothDataType", []):
+        if not isinstance(block, dict):
+            continue
+        name = _find(block.get("device_connected"))
+        if name:
+            return True, True, f"{name} connected"
+        name = _find(block.get("device_not_connected"))
+        if name:
+            return True, False, f"{name} paired (not connected)"
+
+    return False, False, f"{ARCTOP_HEADPHONES_NAME} not found"
+
+
+def _check_arctop_app_running() -> bool:
+    """Return True if a process whose name/cmdline matches 'Arctop' is running."""
+    try:
+        r = subprocess.run(
+            ["pgrep", "-i", "-f", "[Aa]rctop"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+class ArcTopRecorder:
+    """Persistent ArcTop WebSocket client.
+
+    The connection lifecycle is independent of recording:
+
+      connect_stream(url)   — open the WS and keep it open (auto-reconnects)
+      disconnect_stream()   — tear it down
+
+    Recording layers on top of the live stream:
+
+      start_recording(csv)  — start writing each event to CSV
+      stop_recording()      — stop writing, but the WS stays open
+
+    This way the test, the session, and any subsequent sessions all share
+    the same connection — Arctop's portal sees one continuous client.
+    """
+
+    CSV_HEADER = ["recv_utc", "msg_timestamp_ms", "type",
+                  "event_subtype", "paradigm", "score", "raw_json"]
+
+    RECONNECT_DELAY = 2.0
+
+    def __init__(self):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._stream_task: asyncio.Task | None = None
+
+        self.is_connected = False     # WS currently open
+        self.is_recording = False     # writing CSV
+        self.events_received = 0      # since connect_stream
+        self.last_event_utc: str | None = None
+        self.last_error: str | None = None
+
+        self._stream_url: str | None = None
+        self._stop_requested = False
+        self._record_start_count = 0
+
+        self.csv_path: str | None = None
+        self._csv_fh = None
+        self._csv_writer = None
+
+    def start(self):
+        if self._loop:
+            return
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        with contextlib.suppress(Exception):
+            self.disconnect_stream()
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+    # ── Connection lifecycle ───────────────────────────────────────
+    def connect_stream(self, url: str) -> tuple[bool, str]:
+        if not self._loop:
+            return False, "Recorder not started"
+        if not url:
+            return False, "WebSocket URL is empty"
+        if self._stream_task and not self._stream_task.done():
+            return True, "Already connected"
+
+        self._stream_url = url
+        self._stop_requested = False
+        self.events_received = 0
+        self.last_event_utc = None
+        self.last_error = None
+
+        async def _spawn():
+            self._stream_task = asyncio.create_task(self._stream_loop())
+
+        try:
+            asyncio.run_coroutine_threadsafe(_spawn(), self._loop).result(timeout=2)
+        except Exception as exc:
+            return False, str(exc)[:80]
+        return True, "ok"
+
+    def disconnect_stream(self):
+        if not self._loop:
+            return
+        self._stop_requested = True
+
+        async def _shutdown():
+            if self._stream_task and not self._stream_task.done():
+                self._stream_task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await self._stream_task
+            self._stream_task = None
+            self.is_connected = False
+            self._close_csv()
+            self.is_recording = False
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(
+                _shutdown(), self._loop).result(timeout=5)
+
+    async def _stream_loop(self):
+        try:
+            while not self._stop_requested:
+                try:
+                    async with websockets.connect(
+                        self._stream_url, open_timeout=5,
+                        ping_interval=20, ping_timeout=20,
+                    ) as ws:
+                        self.is_connected = True
+                        self.last_error = None
+                        async for raw in ws:
+                            if self._stop_requested:
+                                break
+                            self._handle_message(raw)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_error = str(exc)[:120]
+                self.is_connected = False
+                if self._stop_requested:
+                    break
+                # backoff before reconnect
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(self.RECONNECT_DELAY)
+        finally:
+            self.is_connected = False
+
+    # ── Recording (overlays the live stream) ───────────────────────
+    def start_recording(self, csv_path: str) -> tuple[bool, str]:
+        if not self.is_connected:
+            return False, "Not connected — connect the stream first"
+        if self.is_recording:
+            return False, "Already recording"
+        try:
+            fh = open(csv_path, "w", newline="")
+            writer = csv.writer(fh)
+            writer.writerow(self.CSV_HEADER)
+            fh.flush()
+        except OSError as exc:
+            return False, f"CSV open failed: {exc}"
+
+        self._csv_fh = fh
+        self._csv_writer = writer
+        self.csv_path = csv_path
+        self._record_start_count = self.events_received
+        self.is_recording = True
+        return True, csv_path
+
+    def stop_recording(self) -> int:
+        """Stop CSV writing. Returns the number of events recorded this session."""
+        if not self.is_recording and not self._csv_fh:
+            return 0
+        self.is_recording = False
+        session_count = self.events_received - self._record_start_count
+        if not self._loop:
+            self._close_csv()
+            return session_count
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(
+                self._async_close_csv(), self._loop).result(timeout=2)
+        return session_count
+
+    async def _async_close_csv(self):
+        self._close_csv()
+
+    def _close_csv(self):
+        if self._csv_fh:
+            with contextlib.suppress(Exception):
+                self._csv_fh.flush()
+                self._csv_fh.close()
+        self._csv_fh = None
+        self._csv_writer = None
+
+    def _handle_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(msg, dict):
+            return
+        self.events_received += 1
+        recv = _utc_now()
+        self.last_event_utc = recv
+        if self.is_recording and self._csv_writer:
+            data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+            try:
+                self._csv_writer.writerow([
+                    recv,
+                    msg.get("timestamp", ""),
+                    msg.get("type", ""),
+                    data.get("type", ""),
+                    data.get("paradigm", ""),
+                    data.get("score", ""),
+                    json.dumps(msg, separators=(",", ":")),
+                ])
+                if self.events_received % 50 == 0:
+                    with contextlib.suppress(Exception):
+                        self._csv_fh.flush()
+            except Exception:
+                pass
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Main Application
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -385,6 +656,7 @@ class ChillsDemoApp(ctk.CTk):
         # ── state ────────────────────────────────────────────────────
         self.mode = "frisson"  # "frisson" | "suuvi"
         self.ble = FrissonBLE()
+        self.arctop = ArcTopRecorder()
         self.session_active = False
         self.chills_reports: list[dict] = []
         self.current_song: str | None = None
@@ -398,6 +670,14 @@ class ChillsDemoApp(ctk.CTk):
         self.use_device = True
         self.arctop_confirmed = False
         self.countdown_seconds = 10
+        # EEG recording (Suuvi mode)
+        self.eeg_recording_enabled = False
+        self.eeg_bt_ok = False
+        self.eeg_app_ok = False
+        self.eeg_stream_ok = False
+        self.eeg_csv_filename: str | None = None
+        self.eeg_session_event_count = 0
+        self.arctop_ws_url = ARCTOP_WS_URL
         self._session_update_id: str | None = None
         self._countdown_id: str | None = None
         self._key_bind_id: str | None = None
@@ -435,9 +715,13 @@ class ChillsDemoApp(ctk.CTk):
         )
         self._mode_toggle.set("Frisson")
         self._mode_toggle.grid(row=0, column=1, padx=16, pady=10, sticky="e")
+        # Hidden until clicker setup completes — keeps the first screen focused.
+        self._mode_toggle.grid_remove()
 
         # ── layout: page area + status bar ───────────────────────────
-        self.page_frame = ctk.CTkFrame(self, fg_color="transparent")
+        # Scrollable so taller pages (e.g. Suuvi setup with EEG card) can be
+        # reached without resizing the window.
+        self.page_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.page_frame.grid(row=1, column=0, sticky="nsew", padx=30, pady=(10, 5))
 
         self.status_bar = ctk.CTkFrame(self, height=44, corner_radius=0)
@@ -447,14 +731,77 @@ class ChillsDemoApp(ctk.CTk):
         # ── services ─────────────────────────────────────────────────
         self.ble.start()
         self.ble.on_disconnect_callback = lambda: self.after(0, self._poll_status)
+        self.arctop.start()
 
         # ── participant counter ──────────────────────────────────────
         self.participant_number = self._next_participant_number()
+
+        # ── mousewheel scroll for the page area (macOS-friendly) ─────
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel)
+        self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux up
+        self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux down
 
         # ── go ───────────────────────────────────────────────────────
         self._show_clicker_setup()
         self._poll_status()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_global_mousewheel(self, event):
+        """Forward wheel events to the scrollable page canvas.
+
+        Skips events whose target is a Text/Listbox widget so the URL
+        textbox keeps its own internal scroll behavior.
+        """
+        canvas = getattr(self.page_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+        w = event.widget
+        while w is not None:
+            try:
+                if w.winfo_class() in ("Text", "Listbox"):
+                    return
+                w = w.master
+            except Exception:
+                break
+        if getattr(event, "num", 0) == 4:
+            delta = -1
+        elif getattr(event, "num", 0) == 5:
+            delta = 1
+        elif abs(event.delta) >= 120:  # Windows
+            delta = int(-event.delta / 120)
+        else:                          # macOS (small magnitudes)
+            delta = -int(event.delta) if event.delta else 0
+        if delta:
+            with contextlib.suppress(Exception):
+                canvas.yview_scroll(delta, "units")
+
+    def _apply_wheel_bindings(self):
+        """Bind mousewheel on every descendant of the page so trackpad scroll
+        works regardless of which child the cursor is over (macOS quirk —
+        CTkScrollableFrame's own Enter/Leave handler doesn't fire reliably
+        when the cursor moves directly between sibling children)."""
+        if not hasattr(self, "page_frame") or not self.page_frame.winfo_exists():
+            return
+        handler = self._on_global_mousewheel
+
+        def _bind(w):
+            try:
+                cls = w.winfo_class()
+            except Exception:
+                return
+            if cls not in ("Text", "Listbox"):
+                with contextlib.suppress(Exception):
+                    w.bind("<MouseWheel>", handler, add="+")
+                    w.bind("<Button-4>", handler, add="+")
+                    w.bind("<Button-5>", handler, add="+")
+            try:
+                children = w.winfo_children()
+            except Exception:
+                return
+            for c in children:
+                _bind(c)
+
+        _bind(self.page_frame)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  Clicker Calibration (first screen on launch)
@@ -581,6 +928,7 @@ class ChillsDemoApp(ctk.CTk):
         if self._ck_bind:
             self.unbind("<KeyPress>", self._ck_bind)
             self._ck_bind = None
+        self._mode_toggle.grid()
         self._show_home()
 
     def _clicker_skip(self):
@@ -590,6 +938,7 @@ class ChillsDemoApp(ctk.CTk):
         self.clicker_enabled = False
         self.clicker_vol_down_key = None
         self.clicker_vol_up_key = None
+        self._mode_toggle.grid()
         self._show_home()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -662,6 +1011,9 @@ class ChillsDemoApp(ctk.CTk):
     def _clear_page(self):
         for w in self.page_frame.winfo_children():
             w.destroy()
+        # After the page builder finishes adding new children, bind wheel
+        # events on each one so trackpad scroll works on macOS.
+        self.after_idle(self._apply_wheel_bindings)
 
     def _next_participant_number(self) -> int:
         try:
@@ -887,25 +1239,49 @@ class ChillsDemoApp(ctk.CTk):
                      font=("Helvetica", 30, "bold"),
                      text_color=C_SUUVI).pack(pady=(25, 20))
 
-        # ── ArcTop confirmation ──────────────────────────────────────
+        # ── ArcTop EEG card ──────────────────────────────────────────
         arctop_card = ctk.CTkFrame(self.page_frame, corner_radius=12)
         arctop_card.pack(fill="x", padx=50, pady=(5, 10))
 
-        ctk.CTkLabel(arctop_card, text="ArcTop EEG Headphones",
-                     font=("Helvetica", 16, "bold")).pack(pady=(14, 4))
+        ctk.CTkLabel(arctop_card, text="ArcTop EEG Recording",
+                     font=("Helvetica", 16, "bold")).pack(pady=(14, 2))
         ctk.CTkLabel(arctop_card,
-                     text="Confirm the ArcTop headphones are connected and streaming "
-                          "before starting. The app will record UTC timestamps so "
-                          "button presses can be aligned with EEG data post-hoc.",
-                     font=("Helvetica", 13), text_color=C_MUTED,
-                     wraplength=600, justify="left").pack(padx=20, pady=(0, 8))
+                     text=f"When enabled, every event from the ArcTop WebSocket "
+                          f"is streamed to a CSV alongside the session JSON.",
+                     font=("Helvetica", 12), text_color=C_MUTED,
+                     wraplength=620, justify="center").pack(padx=20, pady=(0, 6))
 
-        self._arctop_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(arctop_card,
-                        text="ArcTop headphones are connected and streaming",
-                        variable=self._arctop_var, font=("Helvetica", 14, "bold"),
-                        text_color=C_SUCCESS,
-                        ).pack(pady=(4, 14))
+        self._eeg_enable_var = ctk.BooleanVar(value=self.eeg_recording_enabled)
+        ctk.CTkSwitch(arctop_card,
+                      text="Collect EEG data during this session",
+                      variable=self._eeg_enable_var,
+                      font=("Helvetica", 14, "bold"),
+                      command=self._on_eeg_toggle,
+                      ).pack(pady=(4, 8))
+
+        # verification rows + URL entry (only populated when toggle is on)
+        self._eeg_check_frame = ctk.CTkFrame(arctop_card, fg_color="transparent")
+        self._eeg_check_frame.pack(fill="x", padx=18, pady=(0, 14))
+        self._build_eeg_check_rows()
+
+        # WebSocket URL entry — sits inside the same expandable section
+        self._eeg_url_frame = ctk.CTkFrame(arctop_card, fg_color="transparent")
+        ctk.CTkLabel(self._eeg_url_frame, text="WebSocket URL:",
+                     font=("Helvetica", 12), text_color=C_MUTED,
+                     anchor="w").pack(fill="x", padx=8, pady=(2, 2))
+        self._eeg_url_entry = ctk.CTkTextbox(
+            self._eeg_url_frame, height=60, font=("Helvetica", 11),
+            wrap="char")
+        self._eeg_url_entry.pack(fill="x", padx=8, pady=(0, 4))
+        self._eeg_url_entry.insert("1.0", self.arctop_ws_url)
+        # invalidate stream test when URL is edited
+        self._eeg_url_entry.bind("<KeyRelease>", self._on_url_edited)
+        ctk.CTkLabel(self._eeg_url_frame,
+                     text="Edit before testing if Arctop's URL/token has changed.",
+                     font=("Helvetica", 10), text_color=C_MUTED,
+                     anchor="w").pack(fill="x", padx=8, pady=(0, 4))
+
+        self._refresh_eeg_check_visibility()
 
         # ── Participant # ────────────────────────────────────────────
         p_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
@@ -963,12 +1339,7 @@ class ChillsDemoApp(ctk.CTk):
                       command=self._prepare_suuvi_session).pack(pady=5)
 
     def _prepare_suuvi_session(self):
-        # validate
-        if not self._arctop_var.get():
-            self._suuvi_status.configure(
-                text="Please confirm ArcTop headphones are connected.",
-                text_color=C_DANGER)
-            return
+        # validate participant + countdown + track first
         try:
             self.participant_number = int(self._p_entry.get())
         except ValueError:
@@ -986,12 +1357,248 @@ class ChillsDemoApp(ctk.CTk):
                 text="No valid track selected.", text_color=C_DANGER)
             return
 
-        self.arctop_confirmed = True
+        # EEG gating: if recording is requested, require all 3 checks green
+        self.eeg_recording_enabled = bool(self._eeg_enable_var.get())
+        if self.eeg_recording_enabled:
+            url = self._get_url_from_entry()
+            if not url:
+                self._suuvi_status.configure(
+                    text="Enter a WebSocket URL for the ArcTop stream.",
+                    text_color=C_DANGER)
+                return
+            self.arctop_ws_url = url
+            if not (self.eeg_bt_ok and self.eeg_app_ok and self.eeg_stream_ok):
+                self._suuvi_status.configure(
+                    text="Run all three EEG checks before starting "
+                         "(or turn off EEG recording).",
+                    text_color=C_DANGER)
+                return
+
+        self.arctop_confirmed = self.eeg_recording_enabled
         self.use_device = False
         self.current_song = os.path.splitext(track)[0]
         self.current_song_file = track
         self.song_duration = 0  # unknown, will end when music stops
         self._run_volume_check()
+
+    # ── EEG check rows ───────────────────────────────────────────────
+
+    def _build_eeg_check_rows(self):
+        for w in self._eeg_check_frame.winfo_children():
+            w.destroy()
+
+        # ── Row 1: Bluetooth ────────────────────────────
+        row1 = ctk.CTkFrame(self._eeg_check_frame, fg_color="transparent")
+        row1.pack(fill="x", pady=4)
+        self._eeg_bt_icon = ctk.CTkLabel(
+            row1, text="•", width=24, font=("Helvetica", 18, "bold"),
+            text_color=C_MUTED)
+        self._eeg_bt_icon.pack(side="left", padx=(8, 6))
+        self._eeg_bt_label = ctk.CTkLabel(
+            row1, text=f"Bluetooth: looking for {ARCTOP_HEADPHONES_NAME}…",
+            anchor="w", font=("Helvetica", 13))
+        self._eeg_bt_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row1, text="Check", width=70, height=26,
+                      font=("Helvetica", 12),
+                      command=self._refresh_bt_check).pack(side="right", padx=8)
+
+        # ── Row 2: ArcTop app ───────────────────────────
+        row2 = ctk.CTkFrame(self._eeg_check_frame, fg_color="transparent")
+        row2.pack(fill="x", pady=4)
+        self._eeg_app_icon = ctk.CTkLabel(
+            row2, text="•", width=24, font=("Helvetica", 18, "bold"),
+            text_color=C_MUTED)
+        self._eeg_app_icon.pack(side="left", padx=(8, 6))
+        self._eeg_app_label = ctk.CTkLabel(
+            row2, text="ArcTop app running on this Mac…",
+            anchor="w", font=("Helvetica", 13))
+        self._eeg_app_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row2, text="Check", width=70, height=26,
+                      font=("Helvetica", 12),
+                      command=self._refresh_app_check).pack(side="right", padx=8)
+
+        # ── Row 3: Data stream (persistent connection) ──
+        row3 = ctk.CTkFrame(self._eeg_check_frame, fg_color="transparent")
+        row3.pack(fill="x", pady=4)
+        self._eeg_stream_icon = ctk.CTkLabel(
+            row3, text="•", width=24, font=("Helvetica", 18, "bold"),
+            text_color=C_MUTED)
+        self._eeg_stream_icon.pack(side="left", padx=(8, 6))
+        self._eeg_stream_label = ctk.CTkLabel(
+            row3, text="Data stream: not connected",
+            anchor="w", font=("Helvetica", 13))
+        self._eeg_stream_label.pack(side="left", fill="x", expand=True)
+        self._eeg_stream_btn = ctk.CTkButton(
+            row3, text="Connect", width=100, height=26,
+            font=("Helvetica", 12),
+            command=self._toggle_eeg_connection)
+        self._eeg_stream_btn.pack(side="right", padx=8)
+
+    def _refresh_eeg_check_visibility(self):
+        on = bool(self._eeg_enable_var.get())
+        if on:
+            self._eeg_check_frame.pack(fill="x", padx=18, pady=(0, 4))
+            self._eeg_url_frame.pack(fill="x", padx=10, pady=(0, 12))
+            # auto-run the lightweight checks immediately
+            self._refresh_bt_check()
+            self._refresh_app_check()
+            # restore any existing connection state in the UI
+            self._update_stream_row_from_state()
+            self._start_stream_poll()
+        else:
+            self._eeg_check_frame.pack_forget()
+            self._eeg_url_frame.pack_forget()
+            self._stop_stream_poll()
+
+    def _get_url_from_entry(self) -> str:
+        return self._eeg_url_entry.get("1.0", "end").strip()
+
+    def _on_url_edited(self, _event=None):
+        # if the URL changes while connected, drop the old connection so the
+        # next "Connect" picks up the new URL
+        if self.arctop.is_connected or (
+                self.arctop._stream_task and not self.arctop._stream_task.done()):
+            self._worker(self.arctop.disconnect_stream, lambda _: None)
+        self.eeg_stream_ok = False
+        if hasattr(self, "_eeg_stream_btn"):
+            self._eeg_stream_btn.configure(text="Connect")
+        if hasattr(self, "_eeg_stream_icon"):
+            self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                            None, "Data stream: URL changed — reconnect")
+
+    def _on_eeg_toggle(self):
+        self._refresh_eeg_check_visibility()
+
+    @staticmethod
+    def _set_check(icon_lbl, text_lbl, ok: bool | None, text: str):
+        if ok is True:
+            icon_lbl.configure(text="✓", text_color=C_SUCCESS)
+        elif ok is False:
+            icon_lbl.configure(text="✗", text_color=C_DANGER)
+        else:
+            icon_lbl.configure(text="…", text_color=C_WARNING)
+        text_lbl.configure(text=text)
+
+    def _refresh_bt_check(self):
+        self._set_check(self._eeg_bt_icon, self._eeg_bt_label,
+                        None, "Bluetooth: scanning…")
+        self._worker(_check_mw75_bluetooth, self._on_bt_check_done)
+
+    def _on_bt_check_done(self, result):
+        paired, connected, text = result
+        ok = paired and connected
+        self.eeg_bt_ok = ok
+        self._set_check(self._eeg_bt_icon, self._eeg_bt_label, ok,
+                        f"Bluetooth: {text}")
+
+    def _refresh_app_check(self):
+        self._set_check(self._eeg_app_icon, self._eeg_app_label,
+                        None, "Checking for ArcTop app…")
+        self._worker(_check_arctop_app_running, self._on_app_check_done)
+
+    def _on_app_check_done(self, running: bool):
+        self.eeg_app_ok = running
+        text = "ArcTop app is running" if running else "ArcTop app not detected"
+        self._set_check(self._eeg_app_icon, self._eeg_app_label, running, text)
+
+    def _toggle_eeg_connection(self):
+        # If already connected (or trying), disconnect.
+        if self.arctop.is_connected or (
+                self.arctop._stream_task and not self.arctop._stream_task.done()):
+            self._eeg_stream_btn.configure(state="disabled", text="Disconnecting…")
+            self._worker(self.arctop.disconnect_stream, self._on_disconnect_done)
+            return
+
+        url = self._get_url_from_entry()
+        if not url:
+            self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                            False, "Data stream: URL is empty")
+            return
+        self.arctop_ws_url = url
+        self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                        None, "Data stream: connecting…")
+        self._eeg_stream_btn.configure(state="disabled", text="Connecting…")
+        self._worker(lambda: self.arctop.connect_stream(url),
+                     self._on_connect_done)
+
+    def _on_connect_done(self, result):
+        ok, msg = result
+        self._eeg_stream_btn.configure(state="normal")
+        if not ok:
+            self.eeg_stream_ok = False
+            self._eeg_stream_btn.configure(text="Connect")
+            self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                            False, f"Data stream: {msg}")
+        else:
+            self._eeg_stream_btn.configure(text="Disconnect")
+            # waiting for first event to confirm streaming
+            self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                            None, "Data stream: connected, waiting for events…")
+
+    def _on_disconnect_done(self, _result):
+        self.eeg_stream_ok = False
+        self._eeg_stream_btn.configure(state="normal", text="Connect")
+        self._set_check(self._eeg_stream_icon, self._eeg_stream_label,
+                        None, "Data stream: disconnected")
+
+    # ── live stream poll (drives the row 3 indicator) ───────────────
+    def _start_stream_poll(self):
+        if getattr(self, "_stream_poll_id", None):
+            return
+        self._stream_poll_id = self.after(500, self._poll_stream_status)
+
+    def _stop_stream_poll(self):
+        if getattr(self, "_stream_poll_id", None):
+            self.after_cancel(self._stream_poll_id)
+            self._stream_poll_id = None
+
+    def _poll_stream_status(self):
+        self._stream_poll_id = None
+        # If the EEG section is hidden or the page changed, stop polling.
+        if (not hasattr(self, "_eeg_stream_icon")
+                or not self._eeg_stream_icon.winfo_exists()):
+            return
+        self._update_stream_row_from_state()
+        self._stream_poll_id = self.after(750, self._poll_stream_status)
+
+    def _update_stream_row_from_state(self):
+        if not hasattr(self, "_eeg_stream_icon"):
+            return
+        if not self._eeg_stream_icon.winfo_exists():
+            return
+        a = self.arctop
+        if a.is_connected:
+            self._eeg_stream_btn.configure(text="Disconnect")
+            # Connection alone is enough to start — Arctop only pushes events
+            # while a paradigm is actively running on the headphones, which
+            # may not be the case yet at setup time.
+            self.eeg_stream_ok = True
+            if a.events_received > 0:
+                self._set_check(
+                    self._eeg_stream_icon, self._eeg_stream_label, True,
+                    f"Data stream: live — {a.events_received} events received")
+            else:
+                self._set_check(
+                    self._eeg_stream_icon, self._eeg_stream_label, True,
+                    "Data stream: connected (waiting for Arctop to push events)")
+        else:
+            self.eeg_stream_ok = False
+            if a.last_error:
+                self._eeg_stream_btn.configure(text="Connect")
+                self._set_check(
+                    self._eeg_stream_icon, self._eeg_stream_label, False,
+                    f"Data stream: {a.last_error}")
+            elif a._stream_task and not a._stream_task.done():
+                # task running but not yet open (initial connect or reconnect backoff)
+                self._eeg_stream_btn.configure(text="Disconnect")
+                self._set_check(
+                    self._eeg_stream_icon, self._eeg_stream_label, None,
+                    "Data stream: connecting…")
+            else:
+                self._eeg_stream_btn.configure(text="Connect")
+                self._set_check(
+                    self._eeg_stream_icon, self._eeg_stream_label, None,
+                    "Data stream: not connected")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  SHARED — Volume Check (before every session)
@@ -1206,6 +1813,13 @@ class ChillsDemoApp(ctk.CTk):
             self._device_dot.pack(pady=(0, 6))
             self._refresh_device_dot()
 
+        # EEG status (Suuvi + recording)
+        if is_suuvi and self.eeg_recording_enabled:
+            self._eeg_session_dot = ctk.CTkLabel(self.page_frame, text="",
+                                                 font=("Helvetica", 12))
+            self._eeg_session_dot.pack(pady=(0, 6))
+            self._refresh_eeg_session_dot()
+
         # countdown / timer label
         self._timer_lbl = ctk.CTkLabel(self.page_frame, text="",
                                        font=("Helvetica", 26, "bold"))
@@ -1278,6 +1892,20 @@ class ChillsDemoApp(ctk.CTk):
         self.playback_start = time.time()
         self.playback_start_utc = _utc_now()
 
+        # Suuvi: open a CSV on the existing live stream. The WebSocket itself
+        # was opened earlier on the setup page (Connect button) and stays up
+        # across sessions, so Arctop's portal sees one continuous client.
+        self.eeg_csv_filename = None
+        self.eeg_session_event_count = 0
+        if self.mode == "suuvi" and self.eeg_recording_enabled:
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+            fname = f"eeg_{now_str}_P{self.participant_number:03d}_{self.current_song}.csv"
+            ok, msg = self.arctop.start_recording(os.path.join(DATA_DIR, fname))
+            if ok:
+                self.eeg_csv_filename = fname
+            else:
+                print(f"[App] EEG recorder failed to start: {msg}")
+
         self._instr_lbl.configure(
             text="Press the clicker (or any key) when you experience chills!",
             text_color=C_MUTED)
@@ -1306,6 +1934,29 @@ class ChillsDemoApp(ctk.CTk):
             self._device_dot.configure(
                 text="Device: DISCONNECTED", text_color=C_DANGER)
         self.after(3000, self._refresh_device_dot)
+
+    def _refresh_eeg_session_dot(self):
+        if not self.session_active:
+            return
+        if not hasattr(self, "_eeg_session_dot"):
+            return
+        if not self._eeg_session_dot.winfo_exists():
+            return
+        a = self.arctop
+        session_count = max(0, a.events_received - a._record_start_count)
+        if a.is_connected and a.is_recording:
+            self._eeg_session_dot.configure(
+                text=f"EEG: recording — {session_count} events this session "
+                     f"(total {a.events_received})",
+                text_color=C_SUCCESS)
+        elif a.is_connected:
+            self._eeg_session_dot.configure(
+                text=f"EEG: connected, not recording (total {a.events_received})",
+                text_color=C_WARNING)
+        else:
+            self._eeg_session_dot.configure(
+                text="EEG: DISCONNECTED", text_color=C_DANGER)
+        self.after(750, self._refresh_eeg_session_dot)
 
     # ── key handler ──────────────────────────────────────────────────
 
@@ -1375,6 +2026,9 @@ class ChillsDemoApp(ctk.CTk):
         if not self.session_active:
             return
         self.session_active = False
+
+        if self.arctop.is_recording:
+            self.eeg_session_event_count = self.arctop.stop_recording()
 
         if self._key_bind_id:
             self.unbind("<KeyPress>", self._key_bind_id)
@@ -1488,6 +2142,9 @@ class ChillsDemoApp(ctk.CTk):
         if self.mode == "suuvi":
             data["arctop_confirmed"] = self.arctop_confirmed
             data["countdown_seconds"] = self.countdown_seconds
+            data["eeg_recording_enabled"] = self.eeg_recording_enabled
+            data["eeg_csv_file"] = self.eeg_csv_filename
+            data["eeg_event_count"] = self.eeg_session_event_count
         else:
             data["device_used"] = self.use_device
             data["device_triggers_planned"] = SONGS.get(self.current_song, {}).get("triggers", [])
@@ -1518,12 +2175,17 @@ class ChillsDemoApp(ctk.CTk):
             self._emergency_save()
         for t in self.trigger_timers:
             t.cancel()
+        with contextlib.suppress(Exception):
+            self.arctop.stop()
         self.ble.stop()
         with contextlib.suppress(Exception):
             pygame.mixer.quit()
         self.destroy()
 
     def _emergency_save(self):
+        if self.arctop.is_recording:
+            with contextlib.suppress(Exception):
+                self.eeg_session_event_count = self.arctop.stop_recording()
         elapsed = (time.time() - self.playback_start) if self.playback_start else 0
         data = {
             "mode": self.mode,
@@ -1538,6 +2200,9 @@ class ChillsDemoApp(ctk.CTk):
             "chills_reports": self.chills_reports,
             "total_chills_count": len(self.chills_reports),
             "post_survey": None,
+            "eeg_recording_enabled": self.eeg_recording_enabled,
+            "eeg_csv_file": self.eeg_csv_filename,
+            "eeg_event_count": self.eeg_session_event_count,
             "note": "Session interrupted — partial data",
         }
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
