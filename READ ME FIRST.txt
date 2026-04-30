@@ -1,0 +1,27 @@
+ChillsDemo — quick-start instructions
+=====================================
+
+You only need to do this once, the very first time:
+
+  1. Move this whole folder somewhere convenient (e.g. your Desktop or
+     Applications folder). Don't run it directly from inside the .zip.
+
+  2. RIGHT-CLICK on   ChillsDemo.command   and pick "Open".
+     macOS will warn that it's from an unidentified developer — click
+     "Open" again on the warning dialog. (You only have to do this once.
+     A normal double-click works for every launch after that.)
+
+The first time you launch, a Terminal window opens and runs the
+installer. Leave it alone — it figures out what's missing and installs
+everything for you (Xcode Command Line Tools, Homebrew, Python, the
+GUI toolkit, and the app's Python dependencies). On a brand-new Mac
+this takes 5–15 minutes the first time and may ask for your Mac
+password once. After that, double-clicking ChillsDemo.command
+launches the app in a few seconds.
+
+If anything goes wrong, the Terminal window stays open with the error
+message — just send a screenshot.
+
+Audio files (Arameic, Hallelujah, Misere, Suuvi/Indigo, etc.) are
+already inside the Stimuli/ folder, so the app is ready to run as soon
+as the install finishes.

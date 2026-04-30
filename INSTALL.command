@@ -1,94 +1,147 @@
 #!/usr/bin/env bash
-# ChillsDemo — first-time install on macOS.
-# Double-click this file to set up the app. Safe to re-run anytime.
+# ChillsDemo — fully unattended setup for macOS.
+# Double-click to install everything (Xcode CLT, Homebrew, Python, tkinter,
+# Python deps) and then launch the app. Re-running is safe and fast.
+#
+# The only manual interactions you may see — and only if those tools
+# aren't already installed on this Mac — are:
+#   - a system dialog asking to install Xcode Command Line Tools
+#   - one Mac password prompt the first time Homebrew installs
+# Otherwise it runs to completion and opens the app for you.
+
 set -e
 cd "$(dirname "$0")"
 
-# Strip the macOS quarantine attribute on every file in this folder so
-# subsequent double-clicks (especially "ChillsDemo.command") don't trigger
-# Gatekeeper warnings. Harmless if no quarantine attr is set.
+# Strip Gatekeeper quarantine so subsequent launches don't re-prompt.
 xattr -dr com.apple.quarantine . 2>/dev/null || true
 
-printf '\nChillsDemo — first-time install\n'
-printf '================================\n\n'
+clear 2>/dev/null || true
+cat <<'BANNER'
+============================================================
+   ChillsDemo Setup
 
-# ── 1. Find a Python 3.10+ interpreter ───────────────────────────────
-PY=""
-for cand in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
-  if command -v "$cand" >/dev/null 2>&1; then
-    if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-      PY="$cand"
-      break
-    fi
-  fi
-done
+   This will install everything the app needs and then
+   launch it. Leave this window open until it says
+   "Setup complete" — it'll close itself when ready.
+============================================================
 
-if [ -z "$PY" ]; then
-  printf '❌ Python 3.10 or newer is not installed on this Mac.\n\n'
-  printf 'Install it from https://www.python.org/downloads/macos/\n'
-  printf '(Pick the latest 3.x release, run the .pkg installer, then\n'
-  printf 'double-click this script again.)\n\n'
-  open "https://www.python.org/downloads/macos/" 2>/dev/null || true
+BANNER
+
+log()  { printf '\n→ %s\n' "$*"; }
+warn() { printf '\n⚠ %s\n' "$*"; }
+fail() {
+  printf '\n❌ %s\n\n' "$*"
   printf 'Press any key to close…'
   read -n 1 -s -r
   printf '\n'
   exit 1
+}
+
+# ── Step 1: ensure Xcode Command Line Tools ──────────────────────────
+# Required for Homebrew, git, compilers used by some pip wheels.
+if ! xcode-select -p >/dev/null 2>&1; then
+  log "Installing Xcode Command Line Tools (a system dialog will appear — click Install)"
+  xcode-select --install >/dev/null 2>&1 || true
+  printf '\nWaiting for Command Line Tools to finish installing…\n'
+  printf '(this can take 5–15 minutes the first time, only happens once)\n'
+  while ! xcode-select -p >/dev/null 2>&1; do
+    sleep 10
+    printf '.'
+  done
+  printf '\n✓ Command Line Tools installed.\n'
+fi
+
+# ── Step 2: locate a working Python 3.10+ with tkinter ───────────────
+PY=""
+find_python() {
+  for cand in \
+      python3.13 python3.14 python3.12 python3.11 python3.10 python3 \
+      /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.14 \
+      /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
+      /opt/homebrew/bin/python3 \
+      /usr/local/bin/python3.13 /usr/local/bin/python3 \
+      /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+      /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+      /Library/Frameworks/Python.framework/Versions/3.11/bin/python3; do
+    if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then
+      if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null \
+         && "$cand" -c 'import tkinter' 2>/dev/null; then
+        PY="$cand"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# ── Step 3: install Homebrew if needed ───────────────────────────────
+ensure_brew() {
+  if command -v brew >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Installing Homebrew (you'll be asked for your Mac password once)"
+  NONINTERACTIVE=1 /bin/bash -c \
+    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    || fail "Homebrew install failed. Try again with a network connection."
+  if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [ -x /usr/local/bin/brew ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+}
+
+if find_python; then
+  log "Found compatible Python: $PY"
+else
+  log "Compatible Python with tkinter not found — installing via Homebrew"
+  ensure_brew
+  log "Installing python@3.13 and python-tk@3.13 (takes 1–3 minutes)"
+  brew install python@3.13 python-tk@3.13 || \
+    fail "Homebrew couldn't install Python. Check the messages above."
+  if ! find_python; then
+    fail "Couldn't find a working Python after install. Try re-running this script in a fresh Terminal."
+  fi
+  log "Installed Python at $PY"
 fi
 
 PYV=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-printf '✓ Using Python %s at %s\n\n' "$PYV" "$(command -v "$PY")"
+log "Using Python $PYV ($PY)"
 
-# ── 2. Verify tkinter is available (the GUI toolkit) ─────────────────
-if ! "$PY" -c "import tkinter" >/dev/null 2>&1; then
-  printf '❌ Your Python is missing the tkinter GUI toolkit.\n\n'
-  if command -v brew >/dev/null 2>&1; then
-    printf 'You appear to have Homebrew. Run this and then re-run me:\n'
-    printf '    brew install python-tk@%s\n\n' "$PYV"
-  else
-    printf 'Easiest fix: install Python from https://www.python.org/downloads/macos/\n'
-    printf '(the python.org installer includes tkinter, unlike Homebrew Python).\n\n'
-  fi
-  printf 'Press any key to close…'
-  read -n 1 -s -r
-  printf '\n'
-  exit 1
+# ── Step 4: virtualenv + Python deps ─────────────────────────────────
+if [ -d "venv" ] && [ ! -x "./venv/bin/python" ]; then
+  warn "Existing venv looks broken — recreating it."
+  rm -rf venv
 fi
-
-# ── 3. Create venv if missing ────────────────────────────────────────
 if [ ! -d "venv" ]; then
-  printf 'Creating virtual environment in ./venv …\n'
-  "$PY" -m venv venv
+  log "Creating virtual environment in ./venv"
+  "$PY" -m venv venv || fail "venv creation failed."
 fi
 
-# Always use venv's Python directly — never the venv's pip script,
-# whose shebang can be stale if the project folder was moved.
 VPY="./venv/bin/python"
+[ -x "$VPY" ] || fail "venv/bin/python missing after venv creation."
 
-if [ ! -x "$VPY" ]; then
-  printf '❌ venv looks broken (no %s). Try deleting the venv folder and running again.\n' "$VPY"
-  printf 'Press any key to close…'
-  read -n 1 -s -r
-  printf '\n'
-  exit 1
-fi
+log "Upgrading pip"
+"$VPY" -m pip install --upgrade pip --quiet || warn "pip upgrade failed (continuing)"
 
-# ── 4. Install dependencies ──────────────────────────────────────────
-printf '\nUpgrading pip and installing dependencies (takes ~30 s on first run)…\n\n'
-"$VPY" -m pip install --upgrade pip
-"$VPY" -m pip install -r requirements.txt
+log "Installing Python dependencies (pygame-ce, customtkinter, bleak, pyserial, websockets)…"
+"$VPY" -m pip install -r requirements.txt || \
+  fail "pip install failed. Check the messages above."
 
-# ── 5. Make sure the data/stimuli folders exist ──────────────────────
+# ── Step 5: directories + launcher executable bit ────────────────────
 mkdir -p Stimuli Stimuli/Suuvi Data
-
-# ── 6. Mark the launcher as executable ───────────────────────────────
 chmod +x "ChillsDemo.command" 2>/dev/null || true
 
-printf '\n============================================================\n'
-printf '✓ Installation complete.\n\n'
-printf 'To launch the app, double-click   ChillsDemo.command\n\n'
-printf 'If you don'\''t have audio files yet, drop them into Stimuli/:\n'
-printf '    Arameic.mp3  Hallelujah.mp3  Misere.mp3\n'
-printf '============================================================\n\n'
-printf 'Press any key to close…'
-read -n 1 -s -r
-printf '\n'
+cat <<'DONE'
+
+============================================================
+✓ Setup complete.
+
+Launching ChillsDemo now. From now on, you can just
+double-click   ChillsDemo.command   to run the app.
+============================================================
+
+DONE
+
+# Replace this shell with the running app — keeps things tidy and
+# means closing the app window terminates this Terminal too.
+exec "$VPY" app.py
