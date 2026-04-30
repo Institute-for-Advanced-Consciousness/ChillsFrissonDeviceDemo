@@ -31,13 +31,29 @@ by the Institute for Advanced Consciousness.
 
 ## Setup
 
-### Requirements
+### Quick install (macOS, double-click)
 
+If someone sent you a **ChillsDemo zip**, this is the easy path:
+
+1. **Unzip** the file. (Finder does this when you double-click it.)
+2. **Double-click `INSTALL.command`** inside the unzipped folder.
+   - If macOS warns "cannot be opened because it is from an
+     unidentified developer", **right-click → Open** the first time.
+     The installer dequarantines the rest of the folder so you only
+     need to do this once.
+   - The installer checks for Python 3.10+, creates a virtualenv,
+     and installs all dependencies. ~30 s the first time.
+   - If Python isn't installed, it opens the python.org download
+     page and asks you to install + re-run.
+3. **Double-click `ChillsDemo.command`** to launch the app. From
+   then on, that's the only file you need.
+
+### Manual install (developer / cross-platform)
+
+Requirements:
 - Python 3.10+ (tested on 3.14)
 - macOS (primary target) or Linux
 - The new Arduino Nano ESP32-based Frisson device, plugged in via USB
-
-### Install
 
 ```bash
 git clone https://github.com/Institute-for-Advanced-Consciousness/ChillsFrissonDeviceDemo.git
@@ -45,10 +61,22 @@ cd ChillsFrissonDeviceDemo
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+python app.py
 ```
 
-> **macOS note**: If using Homebrew Python 3.14, you may need
-> `brew install python-tk@3.14` for the GUI framework.
+> **macOS / Homebrew Python**: If using Homebrew Python 3.14, you may
+> need `brew install python-tk@3.14` for the GUI framework. The
+> double-click installer detects this and prints the exact command.
+
+### Bundling a copy to send to a friend
+
+```bash
+./make_zip.sh
+```
+
+Drops a `ChillsDemo-YYYYMMDD-HHMM.zip` next to the repo, with `venv/`,
+`Data/`, `.git/`, and per-machine state stripped out. Send the zip;
+recipient follows the **Quick install** steps above.
 
 ### Audio files
 
@@ -151,6 +179,9 @@ closed mid-session.
 
 ```
 ├── app.py                  # Main GUI application
+├── INSTALL.command         # macOS double-click installer
+├── ChillsDemo.command      # macOS double-click launcher
+├── make_zip.sh             # Bundle a clean distributable zip
 ├── track_overrides.json    # Per-track trigger time overrides (gitignored)
 ├── requirements.txt        # Python dependencies
 ├── CLAUDE.md               # Development context for AI-assisted continuation
