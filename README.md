@@ -1,31 +1,41 @@
 # Chills Frisson Device Demo
 
-A GUI application for running chills/ASMR experiments with the [Frisson](https://frissoniacs.github.io/) haptic device. Connects directly to the device over Bluetooth Low Energy, plays audio stimuli, triggers the device's peltier elements at predefined moments, captures participant chills reports via button presses, and saves session data automatically.
+A GUI application for running chills/ASMR experiments with the **new
+Arduino Nano ESP32-based Frisson haptic device**. Connects to the device
+over USB serial (BLE is scaffolded for a future firmware version), plays
+audio stimuli, fires the device's three Peltier elements at editable
+moments along the audio timeline, captures participant chills reports
+via button presses, and saves session data automatically.
 
-Built for demo day — designed for a research assistant to operate with many participants cycling through quickly.
+Built for demo day — designed for a research assistant to operate with
+many participants cycling through quickly.
 
-Based on [E4002](https://github.com/Institute-for-Advanced-Consciousness/E4002) by the Institute for Advanced Consciousness.
+Based on [E4002](https://github.com/Institute-for-Advanced-Consciousness/E4002)
+by the Institute for Advanced Consciousness.
 
 ## Features
 
-- **Direct BLE connection** to the Frisson device (no webapp needed)
-- **Test trigger** fires all 3 peltier elements at full strength for 3 seconds
-- **3 audio stimuli** with predefined trigger timings from the E4002 protocol
-- **Cascading trigger pattern**: P3 fires 0.25s before the beat, P2 on the beat, P1 0.25s after — all at max intensity for 3 seconds with overlap
-- **Chills capture**: any key press (clicker or keyboard) is logged with a millisecond timestamp
+- **USB Serial connection** (115200 baud) to the new Arduino-based Frisson device
+- **Verify Device** check sequence (single-channel low/med + wave + emergency stop)
+  with mandatory cooldown timers between fires (Peltier safety)
+- **Editable per-track trigger times** with persisted overrides
+- **Selectable trigger intensity** (low / med / high / max) per session
+- **Manual trigger panel** during a session (P1, P2, P3, Wave, STOP)
+- **Spacebar emergency stop** while a session is running (Frisson mode only)
+- **Chills capture**: any key press is logged with a millisecond timestamp
 - **Post-session survey**: chills yes/no + intensity rating (1–10)
-- **Auto-save**: each session saved as a JSON file with full data
+- **Auto-save**: each session saved as JSON, with full device-event log
+  (scheduled triggers, manual triggers, emergency stops, command failures)
 - **Emergency save**: partial data preserved if the app is closed mid-session
 - **Auto-incrementing participant numbers**
-- **Live device status** in the status bar with disconnect detection
 
 ## Setup
 
 ### Requirements
 
 - Python 3.10+ (tested on 3.14)
-- macOS (for BLE via CoreBluetooth) or Linux (via BlueZ)
-- Frisson haptic device (RFduino-based)
+- macOS (primary target) or Linux
+- The new Arduino Nano ESP32-based Frisson device, plugged in via USB
 
 ### Install
 
@@ -37,11 +47,12 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **macOS note**: If using Homebrew Python 3.14, you may need `brew install python-tk@3.14` for the GUI framework.
+> **macOS note**: If using Homebrew Python 3.14, you may need
+> `brew install python-tk@3.14` for the GUI framework.
 
 ### Audio files
 
-Place your stimulus audio files in the `Stimuli/` directory:
+Place stimulus audio files in `Stimuli/`:
 
 ```
 Stimuli/
@@ -61,43 +72,90 @@ python app.py
 
 ### Workflow
 
-1. **Device Connection** — Power on the Frisson device, click "Scan & Connect". Test the trigger to verify the device responds.
-2. **Session Setup** — Enter participant number, select a song (or Random), click "Start Session".
-3. **Running Session** — Audio plays. The device triggers automatically at the predefined moments. The participant presses a clicker whenever they experience chills. A counter shows real-time chills count.
-4. **Post-Session** — Rate whether chills were experienced and their intensity. Click "Save & Next Participant" — data is saved and the app is ready for the next person.
+1. **Clicker Setup** — calibrate the participant clicker (or skip).
+2. **Device Connection** — pick **USB Serial (new device)**, choose the
+   Arduino's port from the dropdown (usually auto-selected), click
+   **Connect**. Bluetooth is shown as "coming soon" in the UI; only USB
+   serial is functional today.
+3. **Verify Device** — run the four checks (single-channel low, single-channel
+   med, wave-low, emergency stop), each with mandatory cooldown timers between
+   fires. Mark each Pass / Fail / Skip. Or click **Skip Verification**.
+4. **Session Setup** — enter participant number, pick a stimulus, edit
+   trigger times if needed (defaults auto-populate), pick the trigger
+   intensity, click **Start Session**.
+5. **Volume Check** — a reference tone plays at the track's peak loudness;
+   participant adjusts headphone volume until comfortable.
+6. **Running Session** — audio plays. Wave triggers fire at the configured
+   times. Manual P1/P2/P3/Wave/STOP buttons are available. Spacebar is a
+   global emergency stop. Participant clicks the chills button as they
+   experience chills.
+7. **Post-Session** — chills yes/no + intensity rating; data saves to
+   `Data/`.
+
+### Verify Device
+
+Mirrors the breadboard bring-up protocol — prove each component works
+in isolation before committing to a real participant session.
+
+| # | Check | Action | Cooldown |
+|---|-------|--------|----------|
+| 1 | Single channels @ low | Fire P1 / P2 / P3 individually | 30 s |
+| 2 | Single channels @ med | Fire P1 / P2 / P3 individually | 30 s |
+| 3 | Wave (low) | Fire rolling wave P3 → P2 → P1 | 60 s |
+| 4 | Emergency stop | Fire wave-low; auto-`off` after 500 ms | 30 s |
+
+The cooldown is enforced across **all** fire buttons globally — you
+can't rapid-fire even across different rows. Cooldowns aren't UX polish;
+they're a hardware safety feature (we damaged Peltiers earlier in this
+project by firing too rapidly).
+
+### Trigger timings
+
+Defaults shipped with the app — editable in the GUI; per-track edits
+persist across launches in `track_overrides.json`.
+
+| Song       | Default triggers (seconds) |
+|------------|----------------------------|
+| Arameic    | 44, 79, 172                |
+| Hallelujah | 74, 93, 145                |
+| Misere     | 30, 81, 100                |
 
 ### Data output
 
 Session files are saved to `Data/` as JSON:
 
 ```
-Data/session_2026-04-20_143052_P001_Arameic.json
+Data/session_2026-04-29_143052_P001_Arameic.json
 ```
 
-Each file contains:
-- Participant ID and timestamp
-- Song name and duration
-- Every chills button press with its timestamp
-- Device trigger results (planned time, actual time, success)
-- Post-survey responses (chills yes/no, intensity 1–10)
+Each Frisson session file contains:
+- Participant ID, mode, timestamps (UTC)
+- Track name, file, duration
+- `connection_mode`, `device_port`, `intensity_setting`
+- `scheduled_trigger_times` (the resolved list used for this session)
+- `device_events[]` — every fire and emergency stop, with:
+  - `t_ms` (session-relative milliseconds), `utc`
+  - `event` ∈ {`scheduled_trigger`, `manual_trigger`, `emergency_stop`}
+  - `command` (the literal ASCII command sent), `pattern`, `channel`,
+    `intensity`, `success`, `message`, `source`
+  - For scheduled triggers: `planned_sec` and `actual_sec`
+- `verify_skipped` flag and `verify_results[]` per-check pass/fail/skip
+- All chills button presses with timestamps
+- Post-survey responses
 
-### Trigger timings
-
-| Song       | Triggers (seconds into track) |
-|------------|-------------------------------|
-| Arameic    | 44, 79, 172                   |
-| Hallelujah | 74, 93, 145                   |
-| Misere     | 30, 81, 100                   |
+Suuvi-mode session files keep their existing schema (with EEG fields).
+Partial saves (`PARTIAL_*.json`) include the same fields when the app is
+closed mid-session.
 
 ## Project structure
 
 ```
-├── app.py              # Main GUI application
-├── fr_server.py        # WebSocket relay server (legacy, not used by app)
-├── requirements.txt    # Python dependencies
-├── CLAUDE.md           # Development context for AI-assisted continuation
-├── Stimuli/            # Audio files (not committed)
-└── Data/               # Session JSON files (not committed)
+├── app.py                  # Main GUI application
+├── track_overrides.json    # Per-track trigger time overrides (gitignored)
+├── requirements.txt        # Python dependencies
+├── CLAUDE.md               # Development context for AI-assisted continuation
+├── Stimuli/                # Audio files (not committed)
+└── Data/                   # Session JSON files (not committed)
 ```
 
 ## License

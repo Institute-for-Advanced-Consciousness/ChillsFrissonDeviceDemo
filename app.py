@@ -3,11 +3,12 @@
 ChillsDemo — GUI station for running chills / ASMR experiments.
 
 Two modes:
-  * **Frisson** — direct BLE control of the Frisson haptic device with
-    predefined trigger timings per song.
+  * **Frisson** — control of the new Arduino-based Frisson haptic device
+    (USB serial primary; BLE coming in v2 of the device firmware) with
+    editable trigger timings per song and an operator-driven Verify
+    Device check sequence.
   * **Suuvi** — audio-only playback from Stimuli/Suuvi/ with ArcTop EEG
-    headphone integration (configurable pre-play countdown, UTC timestamps
-    for post-hoc alignment).
+    headphone integration.
 
 Launch:
     source venv/bin/activate && python app.py
@@ -15,17 +16,19 @@ Launch:
 
 import array
 import asyncio
+import atexit
 import contextlib
 import csv
 import json
 import math
 import os
 import random
-import struct
+import re
 import subprocess
 import sys
 import threading
 import time
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 # ── Dependency checks ────────────────────────────────────────────────────
@@ -40,13 +43,18 @@ try:
 except ImportError:
     _missing.append("pygame")
 try:
-    from bleak import BleakClient, BleakScanner
+    from bleak import BleakClient, BleakScanner  # noqa: F401 — used by FrissonBLENew stub
 except ImportError:
     _missing.append("bleak")
 try:
     import websockets
 except ImportError:
     _missing.append("websockets")
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    _missing.append("pyserial")
 
 if _missing:
     print("Missing dependencies: " + ", ".join(_missing))
@@ -80,12 +88,22 @@ SONGS = {
     },
 }
 
-# ── Frisson BLE protocol ────────────────────────────────────────────────
-
-FRISSON_SERVICE_UUID = "00002220-0000-1000-8000-00805f9b34fb"
-BLE_TEST_PACKET = bytes([20, 255, 255, 255, 0, 0, 0, 0, 0, 30, 30, 30, 0])
-BLE_SESSION_PACKET = bytes([20, 255, 255, 255, 0, 5, 3, 0, 0, 35, 33, 30, 0])
-TRIGGER_LEAD_TIME = 0.25
+# ── New Frisson Device — ASCII command protocol ────────────────────────
+# Each command is a literal string + '\n', sent over USB serial @ 115200 baud
+# (or eventually BLE). Fire-and-forget; the device queues commands while
+# busy, so don't overlap commands shorter than a pattern's runtime.
+#
+# Single channel:  p{1,2,3}-{low,med,high,max}        (~2 s duration)
+# Rolling wave:    wave-{low,med,high,max}            P3→P2→P1, ~3.5 s total
+# Sequential:      seq-{low,med,high,max}             P1→P2→P3, ~3 s total
+# Simultaneous:    sim-{low,med,high,max}             all three, ~2 s
+# Emergency stop:  off                                 all channels off NOW
+INTENSITY_LEVELS = ("low", "med", "high", "max")
+INTENSITY_DUTY = {"low": 20, "med": 50, "high": 80, "max": 100}
+SERIAL_BAUD = 115200
+ARDUINO_BOOT_DELAY = 1.5  # opening the port resets the Arduino (DTR pulse);
+                          # wait for setup() to finish before sending commands.
+TRACK_OVERRIDES_FILE = "track_overrides.json"  # project-root-relative
 
 # ── ArcTop EEG (Suuvi mode) ─────────────────────────────────────────────
 
@@ -109,6 +127,13 @@ C_SUUVI = "#6c5ce7"  # purple accent for Suuvi mode
 def _utc_now() -> str:
     """ISO-8601 UTC timestamp with milliseconds."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _fmt_num(v: float) -> str:
+    """Format a number for display in the trigger-times entry: drop trailing .0."""
+    if isinstance(v, int) or v == int(v):
+        return str(int(v))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
 
 
 def _scan_suuvi_tracks() -> list[str]:
@@ -180,203 +205,372 @@ def _generate_warm_tone(peak_amp: int, sample_rate: int = 44100,
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  FrissonBLE — persistent direct BLE connection
+#  FrissonDevice — abstract interface + USB serial implementation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Threading model: each implementation runs an asyncio event loop in a
+# daemon thread (mirroring the prior FrissonBLE pattern that the rest of
+# the app already understands). Public methods are blocking sync wrappers
+# that submit coroutines via run_coroutine_threadsafe — call them from
+# worker threads via _worker(), never the tk main thread.
 
 
-class FrissonBLE:
-    """Manages a persistent BLE connection to the Frisson device."""
+class FrissonDevice(ABC):
+    """Abstract Frisson device. Concrete impls: FrissonSerial, FrissonBLENew."""
 
-    def __init__(self):
-        self.connected = False
-        self.device_name = ""
-        self.device_rssi: int | None = None
-        self.services_info: list[dict] = []
-        self.notifications: list[dict] = []
-        self._client: BleakClient | None = None
-        self._write_uuid: str | None = None
-        self._write_response: bool = True
-        self._notify_uuid: str | None = None
+    # Last-line-of-feedback notification; not parsed for control flow.
+    on_disconnect_callback = None
+
+    @property
+    @abstractmethod
+    def is_connected(self) -> bool: ...
+
+    @property
+    @abstractmethod
+    def device_name(self) -> str: ...
+
+    @abstractmethod
+    def start(self) -> None: ...
+
+    @abstractmethod
+    def stop(self) -> None: ...
+
+    @abstractmethod
+    def connect(self) -> tuple[bool, str]: ...
+
+    @abstractmethod
+    def disconnect(self) -> tuple[bool, str]: ...
+
+    @abstractmethod
+    def send_command(self, command: str) -> tuple[bool, str]:
+        """Send one ASCII command (without trailing newline). Fire-and-forget."""
+
+    # ── high-level helpers (shared) ──────────────────────────────────
+    def fire_channel(self, channel: int, intensity: str) -> tuple[bool, str]:
+        if channel not in (1, 2, 3):
+            return False, f"bad channel {channel}"
+        if intensity not in INTENSITY_LEVELS:
+            return False, f"bad intensity {intensity}"
+        return self.send_command(f"p{channel}-{intensity}")
+
+    def fire_wave(self, intensity: str) -> tuple[bool, str]:
+        return self.send_command(f"wave-{intensity}")
+
+    def fire_seq(self, intensity: str) -> tuple[bool, str]:
+        return self.send_command(f"seq-{intensity}")
+
+    def fire_sim(self, intensity: str) -> tuple[bool, str]:
+        return self.send_command(f"sim-{intensity}")
+
+    def emergency_stop(self) -> tuple[bool, str]:
+        return self.send_command("off")
+
+
+class FrissonSerial(FrissonDevice):
+    """USB serial connection to the new Arduino Nano ESP32 device.
+
+    Blocking pyserial I/O is wrapped in run_in_executor on a dedicated
+    asyncio loop, mirroring the existing async-loop-in-background-thread
+    pattern used elsewhere in this app. We chose this over pyserial-asyncio
+    because the latter is unmaintained on Python 3.12+, and run_in_executor
+    is sufficient for a serial port that's never write-saturated.
+    """
+
+    def __init__(self, port: str | None = None, baud: int = SERIAL_BAUD):
+        self.port = port
+        self.baud = baud
+        self._ser: serial.Serial | None = None
+        self._connected = False
+        self._reader_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self.on_disconnect_callback = None
+        self._latest_lines: list[str] = []  # rolling diagnostic log
+        self._max_lines = 200
 
+    # ── lifecycle ────────────────────────────────────────────────────
     def start(self):
+        if self._loop:
+            return
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._loop.run_forever, daemon=True)
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
 
     def stop(self):
-        if self._loop and self._client:
+        if self._loop and self._connected:
             with contextlib.suppress(Exception):
                 asyncio.run_coroutine_threadsafe(
-                    self._safe_disconnect(), self._loop,
-                ).result(timeout=4)
+                    self._async_disconnect(), self._loop).result(timeout=3)
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
-        self.connected = False
+        self._connected = False
 
-    # ── blocking public API ──────────────────────────────────────────
+    # ── public API (blocking) ────────────────────────────────────────
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._ser is not None and self._ser.is_open
 
-    def connect(self):
-        return self._submit(self._do_connect())
+    @property
+    def device_name(self) -> str:
+        return f"USB {self.port}" if self.port else "USB"
 
-    def disconnect(self):
-        return self._submit(self._safe_disconnect())
+    def connect(self) -> tuple[bool, str]:
+        return self._submit(self._async_connect(), timeout=ARDUINO_BOOT_DELAY + 5)
 
-    def send(self, packet):
-        return self._submit(self._do_write(packet))
+    def disconnect(self) -> tuple[bool, str]:
+        return self._submit(self._async_disconnect(), timeout=4)
 
-    def send_and_listen(self, packet, wait=4.0):
-        return self._submit(self._do_write_and_listen(packet, wait), timeout=wait + 5)
+    def send_command(self, command: str) -> tuple[bool, str]:
+        return self._submit(self._async_send(command), timeout=3)
 
-    def _submit(self, coro, timeout=15):
+    def recent_log(self) -> list[str]:
+        return list(self._latest_lines)
+
+    def _submit(self, coro, timeout=8):
         if not self._loop:
-            return False, "BLE not started"
+            return False, "Serial loop not started"
         try:
-            return asyncio.run_coroutine_threadsafe(
-                coro, self._loop).result(timeout=timeout)
+            return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=timeout)
         except Exception as exc:
-            return False, str(exc)[:80]
+            return False, str(exc)[:120]
 
     # ── async internals ──────────────────────────────────────────────
+    async def _async_connect(self) -> tuple[bool, str]:
+        if self._connected:
+            await self._async_disconnect()
+        if not self.port:
+            return False, "No serial port selected"
+        loop = asyncio.get_running_loop()
+        try:
+            self._ser = await loop.run_in_executor(
+                None,
+                lambda: serial.Serial(self.port, self.baud, timeout=0.2,
+                                      write_timeout=2.0))
+        except Exception as exc:
+            self._ser = None
+            return False, f"Open failed: {str(exc)[:100]}"
 
-    async def _do_connect(self):
-        await self._safe_disconnect()
-        self.services_info = []
-        self.notifications = []
+        # Opening the port pulses DTR which resets most Arduino boards.
+        # Wait for setup() to finish before sending real commands.
+        await asyncio.sleep(ARDUINO_BOOT_DELAY)
+        with contextlib.suppress(Exception):
+            self._ser.reset_input_buffer()
 
-        device = await BleakScanner.find_device_by_filter(
-            lambda _d, ad: FRISSON_SERVICE_UUID.lower()
-            in [s.lower() for s in (ad.service_uuids or [])],
-            timeout=6.0)
-        if not device:
-            return False, "Device not found — is it powered on?"
-
-        self.device_rssi = getattr(device, "rssi", None)
-        self._client = BleakClient(
-            device, timeout=8.0, disconnected_callback=self._on_disconnect)
-        await self._client.connect()
-
-        frisson_chars = []
-        for svc in self._client.services:
-            svc_info = {"uuid": svc.uuid, "characteristics": []}
-            for ch in svc.characteristics:
-                svc_info["characteristics"].append({
-                    "uuid": ch.uuid,
-                    "properties": list(ch.properties),
-                    "descriptors": [d.uuid for d in ch.descriptors],
-                })
-                if svc.uuid.lower() == FRISSON_SERVICE_UUID.lower():
-                    frisson_chars.append(ch)
-                    if "notify" in ch.properties or "indicate" in ch.properties:
-                        self._notify_uuid = ch.uuid
-            self.services_info.append(svc_info)
-
-        if len(frisson_chars) >= 2:
-            target = frisson_chars[1]
-            self._write_uuid = target.uuid
-            self._write_response = "write" in target.properties
-        else:
-            for ch in frisson_chars:
-                if "write" in ch.properties or "write-without-response" in ch.properties:
-                    self._write_uuid = ch.uuid
-                    self._write_response = "write" in ch.properties
-                    break
-
-        if not self._write_uuid:
-            await self._client.disconnect()
-            return False, "Write characteristic not found"
-
-        self._notify_uuids = []
-        for svc in self._client.services:
-            for ch in svc.characteristics:
-                if "notify" in ch.properties or "indicate" in ch.properties:
-                    try:
-                        await self._client.start_notify(ch.uuid, self._on_notify)
-                        self._notify_uuids.append(ch.uuid)
-                    except Exception:
-                        pass
-        if self._notify_uuids:
-            self._notify_uuid = self._notify_uuids[0]
-
-        self.connected = True
-        self.device_name = device.name or "Frisson"
+        self._connected = True
+        self._reader_task = asyncio.create_task(self._reader_loop())
         return True, self.device_name
 
-    def _on_notify(self, _sender, data: bytearray):
-        self.notifications.append({
-            "time": time.time(), "data": bytes(data), "hex": data.hex()})
-
-    async def _do_write(self, packet):
-        if not self._client or not self._client.is_connected:
-            self.connected = False
-            return False, "Not connected"
-        try:
-            await self._client.write_gatt_char(
-                self._write_uuid, packet, response=self._write_response)
-            return True, "OK"
-        except Exception as exc:
-            self.connected = False
-            return False, str(exc)[:80]
-
-    async def _read_all_chars(self):
-        reads = []
-        for svc in self._client.services:
-            for ch in svc.characteristics:
-                if "read" in ch.properties:
-                    try:
-                        val = await self._client.read_gatt_char(ch.uuid)
-                        reads.append({"service": svc.uuid, "char": ch.uuid,
-                                      "properties": list(ch.properties),
-                                      "value": bytes(val), "hex": val.hex(" "),
-                                      "text": val.decode("utf-8", errors="replace")})
-                    except Exception as exc:
-                        reads.append({"service": svc.uuid, "char": ch.uuid,
-                                      "properties": list(ch.properties),
-                                      "error": str(exc)[:60]})
-        return reads
-
-    async def _do_write_and_listen(self, packet, wait):
-        if not self._client or not self._client.is_connected:
-            self.connected = False
-            return False, "Not connected", []
-        before = len(self.notifications)
-        reads_before = await self._read_all_chars()
-        try:
-            await self._client.write_gatt_char(
-                self._write_uuid, packet, response=self._write_response)
-        except Exception as exc:
-            self.connected = False
-            return False, str(exc)[:80], []
-        await asyncio.sleep(wait)
-        reads_after = await self._read_all_chars()
-        new_notifs = self.notifications[before:]
-        return True, "OK", {
-            "notifications": [n["data"] for n in new_notifs],
-            "reads_before": reads_before, "reads_after": reads_after}
-
-    async def _safe_disconnect(self):
-        if self._client:
-            for uuid in getattr(self, "_notify_uuids", []):
-                with contextlib.suppress(Exception):
-                    await self._client.stop_notify(uuid)
+    async def _async_disconnect(self) -> tuple[bool, str]:
+        # Try a graceful "off" before closing (best-effort; ignore errors).
+        if self._ser and self._ser.is_open:
             with contextlib.suppress(Exception):
-                if self._client.is_connected:
-                    await self._client.disconnect()
-        self.connected = False
-        self._write_uuid = None
-        self._write_response = True
-        self._notify_uuid = None
+                self._ser.write(b"off\n")
+                self._ser.flush()
+        self._connected = False
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self._reader_task
+        self._reader_task = None
+        if self._ser:
+            with contextlib.suppress(Exception):
+                self._ser.close()
+        self._ser = None
         return True, "Disconnected"
 
-    def _on_disconnect(self, _client):
-        self.connected = False
-        self._write_uuid = None
-        self._notify_uuid = None
-        if self.on_disconnect_callback:
-            self.on_disconnect_callback()
+    async def _async_send(self, command: str) -> tuple[bool, str]:
+        if not self.is_connected:
+            return False, "Not connected"
+        payload = (command.strip() + "\n").encode("ascii", errors="replace")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._blocking_write, payload)
+            return True, "OK"
+        except Exception as exc:
+            self._connected = False
+            return False, f"Write failed: {str(exc)[:100]}"
+
+    def _blocking_write(self, payload: bytes):
+        # Called inside the executor; safe to do blocking serial I/O here.
+        self._ser.write(payload)
+        self._ser.flush()
+
+    async def _reader_loop(self):
+        """Drain the Arduino's diagnostic stdout into a rolling buffer."""
+        loop = asyncio.get_running_loop()
+        try:
+            while self._connected and self._ser and self._ser.is_open:
+                try:
+                    line = await loop.run_in_executor(None, self._blocking_readline)
+                except Exception:
+                    await asyncio.sleep(0.1)
+                    continue
+                if not line:
+                    await asyncio.sleep(0.02)
+                    continue
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self._latest_lines.append(text)
+                    if len(self._latest_lines) > self._max_lines:
+                        self._latest_lines = self._latest_lines[-self._max_lines:]
+                    print(f"[Frisson] {text}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[Frisson] reader stopped: {exc}")
+            self._connected = False
+            if self.on_disconnect_callback:
+                with contextlib.suppress(Exception):
+                    self.on_disconnect_callback()
+
+    def _blocking_readline(self) -> bytes:
+        if not (self._ser and self._ser.is_open):
+            return b""
+        return self._ser.readline()
+
+
+class FrissonBLENew(FrissonDevice):
+    """Stub: BLE support for the new device firmware (v2). Not implemented."""
+    # TODO: implement BLE in v2 of the device firmware. The transport will
+    # send the same ASCII commands as the serial path; only the connection
+    # mechanics differ. Keep the public surface identical.
+
+    def __init__(self):
+        self._loop = None
+
+    @property
+    def is_connected(self) -> bool:
+        return False
+
+    @property
+    def device_name(self) -> str:
+        return "BLE (not yet supported)"
+
+    def start(self): pass
+    def stop(self): pass
+
+    def connect(self) -> tuple[bool, str]:
+        return False, "BLE not yet supported on the new device firmware — use USB Serial"
+
+    def disconnect(self) -> tuple[bool, str]:
+        return True, "noop"
+
+    def send_command(self, command: str) -> tuple[bool, str]:
+        return False, "BLE not connected"
+
+
+def list_serial_ports() -> list[dict]:
+    """Enumerate live USB serial ports, filtering out macOS noise.
+
+    macOS emits two persistent virtual TTYs we never want to see:
+      * /dev/cu.Bluetooth-Incoming-Port — generic RFCOMM listener,
+        present on every Mac regardless of any pairings
+      * /dev/cu.<DeviceName>-…           — every device that has ever
+        paired and offered a Serial Port Profile (e.g. AirPods, MX keys),
+        whether or not it's currently powered or in range
+
+    These all have vid=None (no USB descriptor) and we drop them. We
+    also drop anything whose name explicitly contains 'Bluetooth' as a
+    belt-and-suspenders check.
+    """
+    out = []
+    for p in serial.tools.list_ports.comports():
+        device = p.device or ""
+        description = (p.description or "").strip()
+        manufacturer = (p.manufacturer or "").strip()
+        product = (p.product or "").strip()
+        interface = (p.interface or "").strip()
+        vid = p.vid
+
+        # Drop macOS Bluetooth virtual TTYs (no USB descriptor + name says so).
+        if vid is None:
+            continue
+        joined = f"{device} {description} {manufacturer} {product}".lower()
+        if "bluetooth" in joined:
+            continue
+
+        out.append({
+            "device": device,
+            "description": description,
+            "manufacturer": manufacturer,
+            "product": product,
+            "interface": interface,
+            "is_debug": "debug" in (description + " " + interface).lower(),
+        })
+    return out
+
+
+def auto_pick_arduino_port(ports: list[dict]) -> str | None:
+    """Pick the best Arduino/ESP32 port.
+
+    Prefers entries whose description/manufacturer mentions Arduino or
+    ESP32; among matches, prefers the one that is *not* the debug
+    console (Nano ESP32 enumerates two CDC interfaces — sketch + debug).
+    """
+    pat = re.compile(r"arduino|esp32", re.IGNORECASE)
+    matches = [
+        p for p in ports
+        if pat.search(f"{p['description']} {p['manufacturer']} {p['product']}")
+    ]
+    if not matches:
+        return None
+    # Sketch's Serial first, debug last.
+    matches.sort(key=lambda p: (p["is_debug"], p["device"]))
+    return matches[0]["device"]
+
+
+def load_track_overrides() -> dict[str, list[float]]:
+    """Load per-track trigger time overrides from project-root JSON.
+
+    Returns dict[track_name -> list_of_seconds]. Errors silently → {}.
+    """
+    path = os.path.join(BASE_DIR, TRACK_OVERRIDES_FILE)
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, list) and all(isinstance(x, (int, float)) for x in v):
+                out[k] = [float(x) for x in v]
+    return out
+
+
+def save_track_overrides(overrides: dict[str, list[float]]) -> None:
+    path = os.path.join(BASE_DIR, TRACK_OVERRIDES_FILE)
+    with contextlib.suppress(OSError):
+        with open(path, "w") as f:
+            json.dump(overrides, f, indent=2)
+
+
+def parse_trigger_times(text: str, max_duration: float | None) -> tuple[list[float] | None, str]:
+    """Parse 'a, b, c' → [a, b, c]. Returns (times, error_message).
+
+    Validates: comma-separated non-negative floats, non-decreasing, all under
+    max_duration if provided.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [], ""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    times: list[float] = []
+    for p in parts:
+        try:
+            v = float(p)
+        except ValueError:
+            return None, f"'{p}' is not a number"
+        if v < 0:
+            return None, f"'{p}' is negative"
+        times.append(v)
+    for i in range(1, len(times)):
+        if times[i] < times[i - 1]:
+            return None, "trigger times must be non-decreasing"
+    if max_duration is not None:
+        for v in times:
+            if v >= max_duration:
+                return None, f"{v}s is past track duration ({max_duration:.1f}s)"
+    return times, ""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -655,7 +849,10 @@ class ChillsDemoApp(ctk.CTk):
 
         # ── state ────────────────────────────────────────────────────
         self.mode = "frisson"  # "frisson" | "suuvi"
-        self.ble = FrissonBLE()
+        # Device transport: serial (primary) or ble (stub for v2 firmware).
+        self.connection_mode: str = "serial"   # "serial" | "ble"
+        self.device: FrissonDevice = FrissonSerial()
+        self.device_port: str | None = None    # e.g. /dev/cu.usbmodem1101
         self.arctop = ArcTopRecorder()
         self.session_active = False
         self.chills_reports: list[dict] = []
@@ -664,8 +861,17 @@ class ChillsDemoApp(ctk.CTk):
         self.song_duration = 0
         self.playback_start: float | None = None
         self.playback_start_utc: str | None = None
+        self.playback_start_monotonic: float | None = None
         self.trigger_timers: list[threading.Timer] = []
-        self.device_triggers_fired: list[dict] = []
+        # Unified device-event log: scheduled triggers, manual triggers,
+        # emergency stops, command failures. Replaces the old planned/fired
+        # split; consumed by the session JSON saver.
+        self.device_events: list[dict] = []
+        self.session_trigger_times: list[float] = []
+        self.session_intensity: str = "med"
+        self.verify_results: list[dict] = []   # per-check pass/fail/skip
+        self.verify_skipped: bool = False
+        self.track_overrides: dict[str, list[float]] = load_track_overrides()
         self.participant_number = 1
         self.use_device = True
         self.arctop_confirmed = False
@@ -729,9 +935,10 @@ class ChillsDemoApp(ctk.CTk):
         self._build_status_bar()
 
         # ── services ─────────────────────────────────────────────────
-        self.ble.start()
-        self.ble.on_disconnect_callback = lambda: self.after(0, self._poll_status)
+        self.device.start()
+        self.device.on_disconnect_callback = lambda: self.after(0, self._poll_status)
         self.arctop.start()
+        atexit.register(self._safe_shutdown)
 
         # ── participant counter ──────────────────────────────────────
         self.participant_number = self._next_participant_number()
@@ -740,6 +947,11 @@ class ChillsDemoApp(ctk.CTk):
         self.bind_all("<MouseWheel>", self._on_global_mousewheel)
         self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux up
         self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux down
+
+        # ── global emergency stop (Frisson mode only) ────────────────
+        # Spacebar is deliberate: it's the most likely accidental keystroke
+        # if the participant fumbles the clicker. Keeps Suuvi flow untouched.
+        self.bind_all("<space>", self._on_emergency_stop_key)
 
         # ── go ───────────────────────────────────────────────────────
         self._show_clicker_setup()
@@ -774,6 +986,71 @@ class ChillsDemoApp(ctk.CTk):
         if delta:
             with contextlib.suppress(Exception):
                 canvas.yview_scroll(delta, "units")
+
+    # ── safety hooks ─────────────────────────────────────────────────
+
+    def _on_emergency_stop_key(self, event):
+        """Spacebar global emergency-stop handler. Frisson mode only."""
+        if self.mode != "frisson":
+            return
+        # Don't hijack space inside text entry widgets.
+        try:
+            cls = event.widget.winfo_class()
+        except Exception:
+            cls = ""
+        if cls in ("Entry", "Text", "TEntry", "TText"):
+            return
+        self._emergency_stop("space-key")
+
+    def _emergency_stop(self, source: str = "manual"):
+        """Send 'off' to the device, log, and flash a brief confirmation.
+
+        Safe to call regardless of connection state; no-ops cleanly if the
+        device isn't connected.
+        """
+        ok, msg = (False, "device not connected")
+        if self.device.is_connected:
+            ok, msg = self.device.emergency_stop()
+        self._log_device_event(
+            event="emergency_stop", command="off",
+            success=ok, message=msg, source=source)
+        # Brief visual confirmation (top-of-window banner).
+        with contextlib.suppress(Exception):
+            self._flash_status_banner("Emergency stop sent",
+                                      C_DANGER if not ok else C_WARNING)
+
+    def _flash_status_banner(self, text: str, color: str):
+        """Show a 1.5 s banner overlaid on the status bar."""
+        if not hasattr(self, "status_bar") or not self.status_bar.winfo_exists():
+            return
+        if hasattr(self, "_banner_lbl") and self._banner_lbl.winfo_exists():
+            self._banner_lbl.destroy()
+        self._banner_lbl = ctk.CTkLabel(
+            self.status_bar, text=text, font=("Helvetica", 12, "bold"),
+            text_color=color)
+        self._banner_lbl.grid(row=0, column=2, padx=8, pady=10)
+        self.after(1500, lambda: self._banner_lbl.destroy()
+                   if self._banner_lbl.winfo_exists() else None)
+
+    def _log_device_event(self, **fields):
+        """Append a structured event to the device_events log.
+
+        Always includes session-relative ms, UTC, and any provided fields.
+        """
+        if self.playback_start_monotonic is not None:
+            t_ms = int((time.monotonic() - self.playback_start_monotonic) * 1000)
+        else:
+            t_ms = None
+        entry = {"t_ms": t_ms, "utc": _utc_now(), **fields}
+        self.device_events.append(entry)
+        return entry
+
+    def _safe_shutdown(self):
+        """atexit + on-close hook: stop device cleanly. Idempotent."""
+        with contextlib.suppress(Exception):
+            if self.device and self.device.is_connected:
+                self.device.emergency_stop()
+                self.device.disconnect()
 
     def _apply_wheel_bindings(self):
         """Bind mousewheel on every descendant of the page so trackpad scroll
@@ -983,18 +1260,19 @@ class ChillsDemoApp(ctk.CTk):
         self.lbl_sessions.grid(row=0, column=3, padx=(0, 16), pady=10)
 
     def _poll_status(self):
-        # mode
         if self.mode == "suuvi":
             self.lbl_mode.configure(text="Mode: Suuvi", text_color=C_SUUVI)
             self.lbl_ble.configure(text="No device needed", text_color=C_MUTED)
         else:
             self.lbl_mode.configure(text="Mode: Frisson", text_color=C_PRIMARY)
-            if self.ble.connected:
+            mode_label = "USB" if self.connection_mode == "serial" else "BLE"
+            if self.device.is_connected:
+                detail = self.device.device_name
                 self.lbl_ble.configure(
-                    text=f"Device: {self.ble.device_name}", text_color=C_SUCCESS)
+                    text=f"Device ({mode_label}): {detail}", text_color=C_SUCCESS)
             else:
                 self.lbl_ble.configure(
-                    text="Device: not connected", text_color=C_DANGER)
+                    text=f"Device ({mode_label}): not connected", text_color=C_DANGER)
 
         try:
             n = len([f for f in os.listdir(DATA_DIR) if f.endswith(".json")])
@@ -1048,45 +1326,67 @@ class ChillsDemoApp(ctk.CTk):
         self._clear_page()
 
         ctk.CTkLabel(self.page_frame, text="Frisson Device Connection",
-                     font=("Helvetica", 30, "bold")).pack(pady=(25, 20))
+                     font=("Helvetica", 30, "bold")).pack(pady=(20, 14))
 
-        card = ctk.CTkFrame(self.page_frame, corner_radius=12)
-        card.pack(fill="x", padx=50, pady=10)
-        for i, text in enumerate([
-            "Power on the Frisson device.",
-            "Click 'Scan & Connect' — the app pairs directly over Bluetooth.",
-            "Click 'Test Trigger' to fire all 3 peltiers at full strength for 3 s.",
-        ]):
-            row = ctk.CTkFrame(card, fg_color="transparent")
-            row.pack(fill="x", padx=20, pady=(12 if i == 0 else 3, 12 if i == 2 else 3))
-            ctk.CTkLabel(row, text=f"{i+1}.", font=("Helvetica", 14, "bold"),
-                         text_color=C_PRIMARY, width=28).pack(side="left")
-            ctk.CTkLabel(row, text=text, font=("Helvetica", 14),
-                         wraplength=620, anchor="w", justify="left"
-                         ).pack(side="left", padx=(6, 0))
+        # ── Mode toggle ─────────────────────────────────────────────
+        mode_card = ctk.CTkFrame(self.page_frame, corner_radius=12)
+        mode_card.pack(fill="x", padx=50, pady=(0, 10))
+        ctk.CTkLabel(mode_card, text="Connection mode",
+                     font=("Helvetica", 13, "bold"),
+                     text_color=C_MUTED).pack(pady=(12, 4))
+        self._conn_mode_btn = ctk.CTkSegmentedButton(
+            mode_card, values=["USB Serial (new device)", "Bluetooth (coming soon)"],
+            command=self._on_conn_mode_change,
+            font=("Helvetica", 13, "bold"), width=440)
+        self._conn_mode_btn.set(
+            "USB Serial (new device)" if self.connection_mode == "serial"
+            else "Bluetooth (coming soon)")
+        self._conn_mode_btn.pack(pady=(2, 14))
 
+        # ── Serial port row (visible only in serial mode) ───────────
+        self._serial_card = ctk.CTkFrame(self.page_frame, corner_radius=12)
+        self._serial_card.pack(fill="x", padx=50, pady=(0, 10))
+        ctk.CTkLabel(self._serial_card, text="Serial port",
+                     font=("Helvetica", 13, "bold"),
+                     text_color=C_MUTED).pack(pady=(12, 4))
+        port_row = ctk.CTkFrame(self._serial_card, fg_color="transparent")
+        port_row.pack(fill="x", padx=14, pady=(0, 12))
+        self._port_var = ctk.StringVar(value="")
+        self._port_dropdown = ctk.CTkOptionMenu(
+            port_row, variable=self._port_var, values=[""], width=460,
+            font=("Helvetica", 12))
+        self._port_dropdown.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(port_row, text="Refresh", width=90, height=28,
+                      font=("Helvetica", 12),
+                      command=self._refresh_serial_ports).pack(side="left")
+
+        # ── BLE info card (visible only in BLE mode) ────────────────
+        self._ble_info_card = ctk.CTkFrame(self.page_frame, corner_radius=12)
+        ctk.CTkLabel(
+            self._ble_info_card,
+            text="BLE not yet supported on the new device firmware — use USB Serial for now.",
+            font=("Helvetica", 13), text_color=C_WARNING,
+            wraplength=600, justify="center"
+        ).pack(padx=20, pady=18)
+
+        # ── status + buttons ────────────────────────────────────────
         self._conn_status = ctk.CTkLabel(
             self.page_frame, text="Not connected",
             font=("Courier", 12), text_color=C_MUTED,
             wraplength=700, justify="left", anchor="w")
-        self._conn_status.pack(pady=(16, 10), fill="x", padx=50)
+        self._conn_status.pack(pady=(8, 8), fill="x", padx=50)
 
         btn_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
         btn_row.pack(pady=8)
         self._connect_btn = ctk.CTkButton(
-            btn_row, text="Scan & Connect", font=("Helvetica", 15, "bold"),
-            width=200, height=44, fg_color=C_ACCENT, hover_color="#1a4a7a",
+            btn_row, text="Connect", font=("Helvetica", 15, "bold"),
+            width=160, height=44, fg_color=C_ACCENT, hover_color="#1a4a7a",
             command=self._on_connect)
         self._connect_btn.pack(side="left", padx=8)
         ctk.CTkButton(
             btn_row, text="Disconnect", font=("Helvetica", 15, "bold"),
             width=140, height=44, fg_color="#2d3a4a", hover_color="#3d4a5a",
             command=self._on_disconnect).pack(side="left", padx=8)
-        self._test_btn = ctk.CTkButton(
-            btn_row, text="Test Trigger", font=("Helvetica", 15, "bold"),
-            width=160, height=44, fg_color="#2d3a4a", hover_color="#3d4a5a",
-            command=self._on_test)
-        self._test_btn.pack(side="left", padx=8)
 
         self._skip_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(self.page_frame, text="Run without Frisson device",
@@ -1094,72 +1394,384 @@ class ChillsDemoApp(ctk.CTk):
                         text_color=C_MUTED).pack(pady=(12, 16))
 
         ctk.CTkButton(
-            self.page_frame, text="Continue to Session Setup",
+            self.page_frame, text="Continue to Verify Device",
             font=("Helvetica", 17, "bold"), width=300, height=52,
             fg_color=C_SUCCESS, hover_color="#3ba882", text_color="#000",
-            command=self._go_to_frisson_setup).pack(pady=5)
+            command=self._go_to_verify).pack(pady=5)
 
-        if self.ble.connected:
+        # initial port enumeration + UI sync
+        self._refresh_serial_ports()
+        self._on_conn_mode_change(self._conn_mode_btn.get())
+
+        if self.device.is_connected:
             self._conn_status.configure(
-                text=f"Connected to {self.ble.device_name}", text_color=C_SUCCESS)
+                text=f"Connected to {self.device.device_name}", text_color=C_SUCCESS)
+
+    @staticmethod
+    def _port_label(p: dict) -> str:
+        desc = p["description"] or "?"
+        if p.get("is_debug"):
+            desc += "  [debug — usually NOT what you want]"
+        return f"{p['device']} — {desc}"
+
+    def _refresh_serial_ports(self):
+        ports = list_serial_ports()
+        if not ports:
+            label = "(no serial ports detected)"
+            self._port_dropdown.configure(values=[label])
+            self._port_var.set(label)
+            self._available_ports = []
+            return
+        labels = [self._port_label(p) for p in ports]
+        self._available_ports = ports
+        self._port_dropdown.configure(values=labels)
+        # Auto-pick first Arduino/ESP32 port if any (skipping the debug CDC).
+        auto = auto_pick_arduino_port(ports)
+        idx = 0
+        if auto:
+            for i, p in enumerate(ports):
+                if p["device"] == auto:
+                    idx = i
+                    break
+        self._port_var.set(labels[idx])
+
+    def _selected_port_device(self) -> str | None:
+        if not getattr(self, "_available_ports", None):
+            return None
+        label = self._port_var.get()
+        for p in self._available_ports:
+            if self._port_label(p) == label:
+                return p["device"]
+        return None
+
+    def _on_conn_mode_change(self, value: str):
+        is_serial = value.startswith("USB")
+        self.connection_mode = "serial" if is_serial else "ble"
+        # Swap the right card in/out.
+        if is_serial:
+            self._serial_card.pack(fill="x", padx=50, pady=(0, 10),
+                                   before=self._conn_status)
+            self._ble_info_card.pack_forget()
+            self._connect_btn.configure(state="normal")
+        else:
+            self._ble_info_card.pack(fill="x", padx=50, pady=(0, 10),
+                                     before=self._conn_status)
+            self._serial_card.pack_forget()
+            self._connect_btn.configure(state="disabled")
+        self._poll_status()
 
     def _on_connect(self):
-        self._connect_btn.configure(text="Scanning...", fg_color=C_WARNING)
-        self._conn_status.configure(text="Scanning...", text_color=C_WARNING)
-        self._worker(self.ble.connect, self._connect_done)
+        if self.connection_mode != "serial":
+            return  # button is disabled, defensive
+        port = self._selected_port_device()
+        if not port:
+            self._conn_status.configure(
+                text="Pick a serial port first.", text_color=C_DANGER)
+            return
+        # Recreate the device if the port changed (cheap; loop is reused).
+        if not isinstance(self.device, FrissonSerial) or self.device.port != port:
+            with contextlib.suppress(Exception):
+                self.device.stop()
+            self.device = FrissonSerial(port=port)
+            self.device.on_disconnect_callback = lambda: self.after(0, self._poll_status)
+            self.device.start()
+        self.device_port = port
+        self._connect_btn.configure(text="Connecting...", fg_color=C_WARNING)
+        self._conn_status.configure(
+            text=f"Opening {port} (Arduino reset takes ~{ARDUINO_BOOT_DELAY:.0f}s)…",
+            text_color=C_WARNING)
+        self._worker(self.device.connect, self._connect_done)
 
     def _connect_done(self, result):
         ok, msg = result
         if ok:
             self._connect_btn.configure(text="Connected", fg_color=C_SUCCESS)
-            parts = [f"Connected to {msg}"]
-            if self.ble.device_rssi is not None:
-                parts.append(f"RSSI: {self.ble.device_rssi} dBm")
-            wr_mode = "w/ response" if self.ble._write_response else "no response"
-            parts.append(f"Write: {wr_mode}")
-            parts.append(f"Notify: {'yes' if self.ble._notify_uuid else 'no'}")
-            self._conn_status.configure(text="  |  ".join(parts), text_color=C_SUCCESS)
+            self._conn_status.configure(
+                text=f"Connected to {msg}", text_color=C_SUCCESS)
         else:
             self._connect_btn.configure(text="Retry", fg_color=C_DANGER)
             self._conn_status.configure(text=msg, text_color=C_DANGER)
         self.after(2000, lambda: self._connect_btn.configure(
-            text="Scan & Connect", fg_color=C_ACCENT))
+            text="Connect", fg_color=C_ACCENT))
 
     def _on_disconnect(self):
-        self._worker(self.ble.disconnect, lambda _: self._conn_status.configure(
+        self._worker(self.device.disconnect, lambda _: self._conn_status.configure(
             text="Disconnected", text_color=C_MUTED))
 
-    def _on_test(self):
-        if not self.ble.connected:
-            self._test_btn.configure(text="Not connected", fg_color=C_DANGER)
-            self.after(1500, lambda: self._test_btn.configure(
-                text="Test Trigger", fg_color="#2d3a4a"))
-            return
-        self._test_btn.configure(text="Firing (4 s)...", fg_color=C_WARNING)
-        self._worker(
-            lambda: self.ble.send_and_listen(BLE_TEST_PACKET, wait=4.0),
-            self._test_done)
-
-    def _test_done(self, result):
-        ok, msg, report = result
-        if ok:
-            self._test_btn.configure(text="Device OK!", fg_color=C_SUCCESS)
-            notifs = report.get("notifications", [])
-            if notifs:
-                info = f"Write OK. {len(notifs)} notification(s) received."
-            else:
-                n_sub = len(getattr(self.ble, "_notify_uuids", []))
-                info = f"Write OK. No notifications (subscribed to {n_sub} char(s))."
-            self._conn_status.configure(text=info, text_color=C_SUCCESS)
-        else:
-            self._test_btn.configure(text="Failed", fg_color=C_DANGER)
-            self._conn_status.configure(text=f"Trigger failed: {msg}", text_color=C_DANGER)
-        self.after(3000, lambda: self._test_btn.configure(
-            text="Test Trigger", fg_color="#2d3a4a"))
-
-    def _go_to_frisson_setup(self):
+    def _go_to_verify(self):
         self.use_device = not self._skip_var.get()
+        if not self.use_device:
+            # Skip both verify and the device entirely.
+            self.verify_skipped = True
+            self.verify_results = []
+            self.show_frisson_setup_page()
+            return
+        self.show_verify_device_page()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  FRISSON — PAGE 1b: Verify Device (replaces legacy Test Trigger)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # Cooldowns (seconds) per check type. These are SAFETY values — we
+    # damaged Peltiers earlier in this project by firing too rapidly.
+    # Don't reduce without a hardware reason.
+    _COOLDOWN_SINGLE = 30
+    _COOLDOWN_WAVE = 60
+
+    _VERIFY_CHECKS = [
+        {"id": "ch_low",  "title": "1. Single channels — LOW intensity",
+         "kind": "single", "intensity": "low",
+         "instr": "Touch each Peltier's labeled (cold) side as you fire it. "
+                  "Confirm each one feels distinctly cool. "
+                  "30 s cooldown between fires for heatsink recovery."},
+        {"id": "ch_med",  "title": "2. Single channels — MED intensity",
+         "kind": "single", "intensity": "med",
+         "instr": "Repeat the touch test at MED intensity. "
+                  "Confirm intensity is uniform across all three channels."},
+        {"id": "wave",    "title": "3. Wave pattern (low intensity)",
+         "kind": "wave", "intensity": "low",
+         "instr": "Place three fingers across all three Peltiers. "
+                  "Confirm the rolling sensation propagates correctly. "
+                  "60 s cooldown after firing."},
+        {"id": "estop",   "title": "4. Emergency stop test",
+         "kind": "estop", "intensity": "low",
+         "instr": "Fires wave-low, then sends 'off' after 500 ms. "
+                  "Confirm the wave is interrupted before completing."},
+    ]
+
+    def show_verify_device_page(self):
+        self._clear_page()
+        # Reset state for a fresh run.
+        self._verify_state = {c["id"]: "pending" for c in self._VERIFY_CHECKS}
+        self._verify_cooldown_until = 0.0
+        self._verify_buttons: list = []  # buttons disabled during cooldown
+
+        ctk.CTkLabel(self.page_frame, text="Verify Device",
+                     font=("Helvetica", 30, "bold")).pack(pady=(20, 6))
+        ctk.CTkLabel(self.page_frame,
+                     text="Run each check, mark Pass/Fail/Skip, then proceed.",
+                     font=("Helvetica", 13), text_color=C_MUTED
+                     ).pack(pady=(0, 8))
+
+        # Live cooldown banner (always present, hidden when not cooling).
+        self._verify_cd_lbl = ctk.CTkLabel(
+            self.page_frame, text="", font=("Helvetica", 13, "bold"),
+            text_color=C_WARNING)
+        self._verify_cd_lbl.pack(pady=(0, 8))
+
+        # Build a card per check.
+        for check in self._VERIFY_CHECKS:
+            self._build_verify_check_card(check)
+
+        # Cumulative status + proceed.
+        self._verify_summary_lbl = ctk.CTkLabel(
+            self.page_frame, text="", font=("Helvetica", 13, "bold"))
+        self._verify_summary_lbl.pack(pady=(8, 4))
+
+        proceed = ctk.CTkButton(
+            self.page_frame, text="Proceed to Session Setup",
+            font=("Helvetica", 16, "bold"), width=300, height=48,
+            fg_color=C_SUCCESS, hover_color="#3ba882", text_color="#000",
+            command=self._verify_proceed)
+        proceed.pack(pady=(8, 4))
+
+        skip = ctk.CTkButton(
+            self.page_frame, text="Skip Verification",
+            font=("Helvetica", 12), width=160, height=28,
+            fg_color="transparent", hover_color="#2a2a3e", text_color=C_MUTED,
+            command=self._verify_skip)
+        skip.pack(pady=(2, 16))
+
+        self._tick_verify_cooldown()
+        self._update_verify_summary()
+
+    def _build_verify_check_card(self, check: dict):
+        card = ctk.CTkFrame(self.page_frame, corner_radius=10)
+        card.pack(fill="x", padx=30, pady=6)
+        ctk.CTkLabel(card, text=check["title"], font=("Helvetica", 15, "bold"),
+                     anchor="w").pack(fill="x", padx=14, pady=(10, 2))
+        ctk.CTkLabel(card, text=check["instr"], font=("Helvetica", 12),
+                     text_color=C_MUTED, wraplength=720, justify="left",
+                     anchor="w").pack(fill="x", padx=14, pady=(0, 6))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=(2, 10))
+
+        # Fire buttons depend on the kind.
+        if check["kind"] == "single":
+            for ch in (1, 2, 3):
+                btn = ctk.CTkButton(
+                    row, text=f"Fire P{ch}", width=110, height=32,
+                    font=("Helvetica", 13, "bold"),
+                    fg_color=C_ACCENT, hover_color="#1a4a7a")
+                btn.configure(command=lambda c=ch, ck=check, b=btn:
+                              self._fire_verify(ck, b, channel=c))
+                btn.pack(side="left", padx=4)
+                self._verify_buttons.append(btn)
+        elif check["kind"] == "wave":
+            btn = ctk.CTkButton(
+                row, text="Fire Wave (low)", width=180, height=32,
+                font=("Helvetica", 13, "bold"),
+                fg_color=C_ACCENT, hover_color="#1a4a7a")
+            btn.configure(command=lambda ck=check, b=btn: self._fire_verify(ck, b))
+            btn.pack(side="left", padx=4)
+            self._verify_buttons.append(btn)
+        elif check["kind"] == "estop":
+            btn = ctk.CTkButton(
+                row, text="Test Emergency Stop", width=200, height=32,
+                font=("Helvetica", 13, "bold"),
+                fg_color=C_DANGER, hover_color="#c0392b")
+            btn.configure(command=lambda ck=check, b=btn:
+                          self._fire_verify_estop(ck, b))
+            btn.pack(side="left", padx=4)
+            self._verify_buttons.append(btn)
+
+        # Pass / Fail / Skip toggles.
+        var = ctk.StringVar(value="pending")
+        seg = ctk.CTkSegmentedButton(
+            row, values=["pending", "pass", "fail", "skip"],
+            variable=var, width=300, font=("Helvetica", 11),
+            command=lambda v, cid=check["id"]: self._on_verify_mark(cid, v))
+        seg.pack(side="right", padx=4)
+
+    def _fire_verify(self, check: dict, btn, channel: int | None = None):
+        if not self._verify_can_fire():
+            return
+        intensity = check["intensity"]
+        if channel is not None:
+            ok, msg = self._do_fire(channel=channel, intensity=intensity)
+        else:
+            ok, msg = self._do_fire(pattern="wave", intensity=intensity)
+        cooldown = (self._COOLDOWN_WAVE if check["kind"] == "wave"
+                    else self._COOLDOWN_SINGLE)
+        self._begin_verify_cooldown(cooldown)
+        if not ok:
+            self._verify_cd_lbl.configure(
+                text=f"Command failed: {msg}", text_color=C_DANGER)
+
+    def _fire_verify_estop(self, check: dict, btn):
+        if not self._verify_can_fire():
+            return
+        ok, _ = self._do_fire(pattern="wave", intensity="low")
+        if not ok:
+            return
+        self.after(500, lambda: self._emergency_stop(source="verify-test"))
+        # Short cooldown — wave was interrupted, but still let things settle.
+        self._begin_verify_cooldown(self._COOLDOWN_SINGLE)
+
+    def _verify_can_fire(self) -> bool:
+        if time.monotonic() < self._verify_cooldown_until:
+            return False
+        if self.connection_mode != "serial" or not self.device.is_connected:
+            self._verify_cd_lbl.configure(
+                text="Device not connected.", text_color=C_DANGER)
+            return False
+        return True
+
+    def _begin_verify_cooldown(self, seconds: float):
+        self._verify_cooldown_until = time.monotonic() + seconds
+        for b in self._verify_buttons:
+            b.configure(state="disabled")
+        self._tick_verify_cooldown()
+
+    def _tick_verify_cooldown(self):
+        remaining = max(0.0, self._verify_cooldown_until - time.monotonic())
+        if remaining > 0:
+            self._verify_cd_lbl.configure(
+                text=f"Cooldown — {int(remaining)+1} s before next fire",
+                text_color=C_WARNING)
+            self.after(250, self._tick_verify_cooldown)
+        else:
+            self._verify_cd_lbl.configure(text="", text_color=C_WARNING)
+            for b in self._verify_buttons:
+                with contextlib.suppress(Exception):
+                    b.configure(state="normal")
+
+    def _on_verify_mark(self, check_id: str, value: str):
+        self._verify_state[check_id] = value
+        self._update_verify_summary()
+
+    def _update_verify_summary(self):
+        states = list(self._verify_state.values())
+        n_total = len(states)
+        n_pass = states.count("pass")
+        n_fail = states.count("fail")
+        n_skip = states.count("skip")
+        n_pending = states.count("pending")
+        if n_pass == n_total:
+            text = "All checks passed — ready for session"
+            color = C_SUCCESS
+        elif n_fail or (n_skip and n_pending == 0):
+            text = (f"{n_pass} pass / {n_fail} fail / {n_skip} skip — "
+                    "not all checks passed")
+            color = C_WARNING
+        else:
+            text = (f"{n_pass} pass / {n_fail} fail / {n_skip} skip / "
+                    f"{n_pending} pending")
+            color = C_MUTED
+        self._verify_summary_lbl.configure(text=text, text_color=color)
+
+    def _verify_proceed(self):
+        # Snapshot results for the session JSON.
+        self.verify_results = [
+            {"check": cid, "result": self._verify_state.get(cid, "pending"),
+             "utc": _utc_now()}
+            for cid in (c["id"] for c in self._VERIFY_CHECKS)]
+        self.verify_skipped = False
         self.show_frisson_setup_page()
+
+    def _verify_skip(self):
+        self.verify_skipped = True
+        self.verify_results = []
+        self.show_frisson_setup_page()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  FRISSON — Device fire helpers (used by verify + session)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _do_fire(self, *, channel: int | None = None,
+                 pattern: str = "single", intensity: str = "med",
+                 source: str = "manual") -> tuple[bool, str]:
+        """Fire a command on the device. Logs into device_events.
+
+        - channel: 1/2/3 for single, ignored otherwise
+        - pattern: "single" | "wave" | "seq" | "sim"
+        - intensity: low/med/high/max
+        - source: "scheduled" | "manual" | "verify" | etc. (logged)
+        """
+        if intensity not in INTENSITY_LEVELS:
+            return False, f"bad intensity {intensity}"
+        if not self.device.is_connected:
+            self._log_device_event(
+                event=("scheduled_trigger" if source == "scheduled"
+                       else "manual_trigger"),
+                command=None, channel=channel, pattern=pattern,
+                intensity=intensity, success=False,
+                message="device not connected", source=source)
+            return False, "device not connected"
+        if pattern == "single":
+            if channel not in (1, 2, 3):
+                return False, "bad channel"
+            cmd = f"p{channel}-{intensity}"
+            ok, msg = self.device.fire_channel(channel, intensity)
+        elif pattern == "wave":
+            cmd = f"wave-{intensity}"
+            ok, msg = self.device.fire_wave(intensity)
+        elif pattern == "seq":
+            cmd = f"seq-{intensity}"
+            ok, msg = self.device.fire_seq(intensity)
+        elif pattern == "sim":
+            cmd = f"sim-{intensity}"
+            ok, msg = self.device.fire_sim(intensity)
+        else:
+            return False, f"unknown pattern {pattern}"
+        self._log_device_event(
+            event=("scheduled_trigger" if source == "scheduled"
+                   else "manual_trigger"),
+            command=cmd, channel=channel if pattern == "single" else None,
+            pattern=pattern, intensity=intensity, success=ok,
+            message=msg, source=source)
+        return ok, msg
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  FRISSON — PAGE 2: Session Setup
@@ -1169,47 +1781,136 @@ class ChillsDemoApp(ctk.CTk):
         self._clear_page()
 
         ctk.CTkLabel(self.page_frame, text="Frisson Session Setup",
-                     font=("Helvetica", 30, "bold")).pack(pady=(30, 25))
+                     font=("Helvetica", 30, "bold")).pack(pady=(20, 18))
 
         p_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
-        p_row.pack(pady=8)
+        p_row.pack(pady=4)
         ctk.CTkLabel(p_row, text="Participant #:",
                      font=("Helvetica", 16)).pack(side="left", padx=(0, 10))
-        self._p_entry = ctk.CTkEntry(p_row, width=80, font=("Helvetica", 16), justify="center")
+        self._p_entry = ctk.CTkEntry(p_row, width=80, font=("Helvetica", 16),
+                                     justify="center")
         self._p_entry.insert(0, str(self.participant_number))
         self._p_entry.pack(side="left")
 
+        # ── stimulus picker ─────────────────────────────────────────
         ctk.CTkLabel(self.page_frame, text="Select Stimulus:",
-                     font=("Helvetica", 16), text_color=C_MUTED).pack(pady=(25, 10))
+                     font=("Helvetica", 16), text_color=C_MUTED).pack(pady=(20, 6))
         self._song_var = ctk.StringVar(value="Random")
         sf = ctk.CTkFrame(self.page_frame, fg_color="transparent")
         sf.pack()
         for opt in ["Random"] + list(SONGS.keys()):
-            ctk.CTkRadioButton(sf, text=opt, variable=self._song_var, value=opt,
-                               font=("Helvetica", 15)).pack(anchor="w", padx=50, pady=5)
+            ctk.CTkRadioButton(
+                sf, text=opt, variable=self._song_var, value=opt,
+                font=("Helvetica", 14),
+                command=self._on_song_change).pack(anchor="w", padx=80, pady=3)
 
-        self._audio_lbl = ctk.CTkLabel(self.page_frame, text="", font=("Helvetica", 12))
-        self._audio_lbl.pack(pady=(16, 0))
+        # ── trigger times (editable) ────────────────────────────────
+        trig_card = ctk.CTkFrame(self.page_frame, corner_radius=10)
+        trig_card.pack(fill="x", padx=40, pady=(14, 6))
+        ctk.CTkLabel(trig_card, text="Trigger times (seconds, comma-separated)",
+                     font=("Helvetica", 13, "bold")
+                     ).pack(pady=(10, 2), padx=14, anchor="w")
+        ctk.CTkLabel(trig_card,
+                     text="Auto-filled with the song's defaults. Edit to override; "
+                          "edits persist per-track across launches.",
+                     font=("Helvetica", 11), text_color=C_MUTED,
+                     wraplength=680, justify="left",
+                     anchor="w").pack(padx=14, pady=(0, 4), fill="x")
+        trig_row = ctk.CTkFrame(trig_card, fg_color="transparent")
+        trig_row.pack(fill="x", padx=14, pady=(2, 4))
+        self._triggers_entry = ctk.CTkEntry(
+            trig_row, font=("Courier", 14), width=420, justify="left")
+        self._triggers_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(trig_row, text="Reset to defaults", width=140, height=28,
+                      font=("Helvetica", 12),
+                      command=self._reset_triggers).pack(side="left")
+        self._triggers_err = ctk.CTkLabel(
+            trig_card, text="", font=("Helvetica", 11), text_color=C_DANGER,
+            anchor="w", justify="left")
+        self._triggers_err.pack(pady=(0, 10), padx=14, fill="x")
+
+        # ── intensity selector ──────────────────────────────────────
+        int_row = ctk.CTkFrame(self.page_frame, fg_color="transparent")
+        int_row.pack(pady=(8, 4))
+        ctk.CTkLabel(int_row, text="Trigger intensity:",
+                     font=("Helvetica", 14)).pack(side="left", padx=(0, 8))
+        self._intensity_session_var = ctk.StringVar(value=self.session_intensity)
+        ctk.CTkOptionMenu(int_row, variable=self._intensity_session_var,
+                          values=list(INTENSITY_LEVELS), width=110,
+                          font=("Helvetica", 13)).pack(side="left")
+        ctk.CTkLabel(int_row,
+                     text="  (used for scheduled waves and manual fires)",
+                     font=("Helvetica", 11), text_color=C_MUTED
+                     ).pack(side="left", padx=(8, 0))
+
+        # ── audio file presence ─────────────────────────────────────
+        self._audio_lbl = ctk.CTkLabel(self.page_frame, text="",
+                                       font=("Helvetica", 12))
+        self._audio_lbl.pack(pady=(10, 0))
         missing = [c["file"] for c in SONGS.values()
                    if not os.path.exists(os.path.join(STIMULI_DIR, c["file"]))]
         if missing:
-            self._audio_lbl.configure(text=f"Missing: {', '.join(missing)}", text_color=C_WARNING)
+            self._audio_lbl.configure(
+                text=f"Missing: {', '.join(missing)}", text_color=C_WARNING)
         else:
-            self._audio_lbl.configure(text="All audio files found", text_color=C_SUCCESS)
+            self._audio_lbl.configure(
+                text="All audio files found", text_color=C_SUCCESS)
 
-        if self.use_device and not self.ble.connected:
+        if self.use_device and not self.device.is_connected:
             ctk.CTkLabel(self.page_frame,
                          text="Device not connected — go back or check 'run without'",
-                         font=("Helvetica", 12), text_color=C_WARNING).pack(pady=(6, 0))
+                         font=("Helvetica", 12), text_color=C_WARNING
+                         ).pack(pady=(6, 0))
 
         ctk.CTkButton(self.page_frame, text="Start Session",
                       font=("Helvetica", 18, "bold"), width=260, height=55,
                       fg_color=C_PRIMARY, hover_color="#c93a52",
-                      command=self._prepare_frisson_session).pack(pady=25)
+                      command=self._prepare_frisson_session).pack(pady=22)
         ctk.CTkButton(self.page_frame, text="Back to Device Setup",
                       font=("Helvetica", 13), width=200, height=34,
-                      fg_color="transparent", hover_color="#2a2a3e", text_color=C_MUTED,
+                      fg_color="transparent", hover_color="#2a2a3e",
+                      text_color=C_MUTED,
                       command=self.show_connection_page).pack()
+
+        # initial fill of triggers
+        self._on_song_change()
+
+    def _current_song_name(self) -> str:
+        choice = self._song_var.get()
+        if choice == "Random":
+            return random.choice(list(SONGS.keys()))
+        return choice
+
+    def _on_song_change(self):
+        # On Random we don't lock the song until Start, but we do show
+        # something meaningful: defaults of the first song so the user
+        # can still edit without surprise.
+        choice = self._song_var.get()
+        song = (choice if choice != "Random"
+                else next(iter(SONGS.keys())))
+        self._fill_triggers_for(song)
+
+    def _fill_triggers_for(self, song: str):
+        triggers = self.track_overrides.get(song)
+        if triggers is None:
+            triggers = list(SONGS.get(song, {}).get("triggers", []))
+        text = ", ".join(_fmt_num(t) for t in triggers)
+        self._triggers_entry.delete(0, "end")
+        self._triggers_entry.insert(0, text)
+        self._triggers_err.configure(text="")
+
+    def _reset_triggers(self):
+        choice = self._song_var.get()
+        song = (choice if choice != "Random"
+                else next(iter(SONGS.keys())))
+        # Drop the override and refill.
+        self.track_overrides.pop(song, None)
+        save_track_overrides(self.track_overrides)
+        defaults = list(SONGS.get(song, {}).get("triggers", []))
+        text = ", ".join(_fmt_num(t) for t in defaults)
+        self._triggers_entry.delete(0, "end")
+        self._triggers_entry.insert(0, text)
+        self._triggers_err.configure(text="")
 
     def _prepare_frisson_session(self):
         try:
@@ -1218,14 +1919,31 @@ class ChillsDemoApp(ctk.CTk):
             self._p_entry.configure(border_color=C_DANGER)
             return
         choice = self._song_var.get()
-        self.current_song = random.choice(list(SONGS.keys())) if choice == "Random" else choice
+        self.current_song = (random.choice(list(SONGS.keys()))
+                             if choice == "Random" else choice)
         cfg = SONGS[self.current_song]
         self.current_song_file = cfg["file"]
         path = os.path.join(STIMULI_DIR, cfg["file"])
         if not os.path.exists(path):
-            self._audio_lbl.configure(text=f"Not found: {cfg['file']}", text_color=C_DANGER)
+            self._audio_lbl.configure(
+                text=f"Not found: {cfg['file']}", text_color=C_DANGER)
             return
         self.song_duration = cfg["duration_est"]
+        # Parse + validate trigger times against the track duration.
+        times, err = parse_trigger_times(
+            self._triggers_entry.get(), max_duration=cfg["duration_est"])
+        if times is None:
+            self._triggers_err.configure(text=err)
+            return
+        self.session_trigger_times = times
+        # Persist only if they differ from defaults.
+        defaults = list(cfg.get("triggers", []))
+        if times != defaults:
+            self.track_overrides[self.current_song] = times
+            save_track_overrides(self.track_overrides)
+        self.session_intensity = self._intensity_session_var.get()
+        if self.session_intensity not in INTENSITY_LEVELS:
+            self.session_intensity = "med"
         self._run_volume_check()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1790,11 +2508,12 @@ class ChillsDemoApp(ctk.CTk):
         self._clear_page()
 
         self.chills_reports = []
-        self.device_triggers_fired = []
+        self.device_events = []
         self.session_active = True
         self.trigger_timers = []
         self.playback_start = None
         self.playback_start_utc = None
+        self.playback_start_monotonic = None
 
         is_suuvi = (self.mode == "suuvi")
         accent = C_SUUVI if is_suuvi else C_PRIMARY
@@ -1844,6 +2563,41 @@ class ChillsDemoApp(ctk.CTk):
             font=("Helvetica", 15), text_color=C_MUTED)
         self._instr_lbl.pack(pady=(0, 25))
 
+        # Manual trigger panel (Frisson only) — gives the operator ad-hoc
+        # control during a session. All fires are logged as manual_trigger.
+        if not is_suuvi:
+            mt_card = ctk.CTkFrame(self.page_frame, corner_radius=10)
+            mt_card.pack(fill="x", padx=80, pady=(0, 14))
+            ctk.CTkLabel(mt_card,
+                         text=f"Manual triggers — intensity: {self.session_intensity}",
+                         font=("Helvetica", 12, "bold"), text_color=C_MUTED
+                         ).pack(pady=(8, 4))
+            mt_row = ctk.CTkFrame(mt_card, fg_color="transparent")
+            mt_row.pack(pady=(0, 10))
+            for ch in (1, 2, 3):
+                ctk.CTkButton(
+                    mt_row, text=f"P{ch}", width=70, height=32,
+                    font=("Helvetica", 13, "bold"),
+                    fg_color=C_ACCENT, hover_color="#1a4a7a",
+                    command=lambda c=ch: self._do_fire(
+                        channel=c, pattern="single",
+                        intensity=self.session_intensity, source="manual")
+                ).pack(side="left", padx=4)
+            ctk.CTkButton(
+                mt_row, text="Wave", width=90, height=32,
+                font=("Helvetica", 13, "bold"),
+                fg_color=C_ACCENT, hover_color="#1a4a7a",
+                command=lambda: self._do_fire(
+                    pattern="wave", intensity=self.session_intensity,
+                    source="manual")
+            ).pack(side="left", padx=8)
+            ctk.CTkButton(
+                mt_row, text="STOP", width=90, height=32,
+                font=("Helvetica", 13, "bold"),
+                fg_color=C_DANGER, hover_color="#c0392b",
+                command=lambda: self._emergency_stop(source="session-button")
+            ).pack(side="left", padx=8)
+
         ctk.CTkButton(self.page_frame, text="Stop Session",
                       font=("Helvetica", 14, "bold"), width=160, height=40,
                       fg_color=C_DANGER, hover_color="#c0392b",
@@ -1891,6 +2645,11 @@ class ChillsDemoApp(ctk.CTk):
 
         self.playback_start = time.time()
         self.playback_start_utc = _utc_now()
+        # Monotonic clock for trigger scheduling — wall-clock isn't safe.
+        # TODO (v2): replace with pygame.mixer.music.get_pos() polling for
+        # research-grade timing precision. Current approach has ~10–50 ms
+        # drift from audio backend startup latency.
+        self.playback_start_monotonic = time.monotonic()
 
         # Suuvi: open a CSV on the existing live stream. The WebSocket itself
         # was opened earlier on the setup page (Connect button) and stays up
@@ -1910,12 +2669,13 @@ class ChillsDemoApp(ctk.CTk):
             text="Press the clicker (or any key) when you experience chills!",
             text_color=C_MUTED)
 
-        # Frisson: schedule BLE triggers
-        if self.mode == "frisson" and self.use_device and self.ble.connected:
-            cfg = SONGS.get(self.current_song, {})
-            for t in cfg.get("triggers", []):
-                fire_at = max(0.0, t - TRIGGER_LEAD_TIME)
-                timer = threading.Timer(fire_at, self._fire_trigger, args=[t])
+        # Frisson: schedule wave triggers at the parsed times.
+        if self.mode == "frisson" and self.use_device and self.device.is_connected:
+            for t in self.session_trigger_times:
+                timer = threading.Timer(
+                    max(0.0, float(t)),
+                    self._fire_scheduled_trigger,
+                    args=[float(t)])
                 timer.daemon = True
                 timer.start()
                 self.trigger_timers.append(timer)
@@ -1927,9 +2687,11 @@ class ChillsDemoApp(ctk.CTk):
     def _refresh_device_dot(self):
         if not self.session_active:
             return
-        if self.ble.connected:
+        if not hasattr(self, "_device_dot") or not self._device_dot.winfo_exists():
+            return
+        if self.device.is_connected:
             self._device_dot.configure(
-                text=f"Device: {self.ble.device_name}", text_color=C_SUCCESS)
+                text=f"Device: {self.device.device_name}", text_color=C_SUCCESS)
         else:
             self._device_dot.configure(
                 text="Device: DISCONNECTED", text_color=C_DANGER)
@@ -1986,16 +2748,27 @@ class ChillsDemoApp(ctk.CTk):
         self._chills_lbl.configure(text=str(n), text_color=C_SUUVI if self.mode == "suuvi" else C_PRIMARY)
         self.after(180, lambda: self._chills_lbl.configure(text_color=("gray90", "gray90")))
 
-    # ── trigger via BLE (Frisson only) ───────────────────────────────
+    # ── scheduled trigger (Frisson only, runs on threading.Timer thread) ──
 
-    def _fire_trigger(self, planned):
+    def _fire_scheduled_trigger(self, planned: float):
         if not self.session_active:
             return
-        ok, _msg = self.ble.send(BLE_SESSION_PACKET)
-        actual = (time.time() - self.playback_start) if self.playback_start else planned
-        self.device_triggers_fired.append({
-            "planned_sec": planned, "actual_sec": round(actual, 3),
-            "utc": _utc_now(), "success": ok})
+        # Marshal the actual command back onto the main thread so logging
+        # and any UI side effects happen on the main loop.
+        self.after(0, lambda p=planned: self._do_scheduled_fire(p))
+
+    def _do_scheduled_fire(self, planned: float):
+        if not self.session_active:
+            return
+        ok, msg = self._do_fire(
+            pattern="wave", intensity=self.session_intensity,
+            source="scheduled")
+        # Augment the just-logged event with planned/actual seconds.
+        if self.device_events:
+            actual = ((time.monotonic() - self.playback_start_monotonic)
+                      if self.playback_start_monotonic else planned)
+            self.device_events[-1]["planned_sec"] = round(planned, 3)
+            self.device_events[-1]["actual_sec"] = round(actual, 3)
 
     # ── session timer / progress ─────────────────────────────────────
 
@@ -2045,6 +2818,11 @@ class ChillsDemoApp(ctk.CTk):
 
         with contextlib.suppress(Exception):
             pygame.mixer.music.stop()
+
+        # Audio stopped → make sure no Peltiers are still firing.
+        if self.mode == "frisson" and self.device.is_connected:
+            with contextlib.suppress(Exception):
+                self.device.emergency_stop()
 
         self.show_post_session_page()
 
@@ -2147,8 +2925,13 @@ class ChillsDemoApp(ctk.CTk):
             data["eeg_event_count"] = self.eeg_session_event_count
         else:
             data["device_used"] = self.use_device
-            data["device_triggers_planned"] = SONGS.get(self.current_song, {}).get("triggers", [])
-            data["device_triggers_fired"] = self.device_triggers_fired
+            data["connection_mode"] = self.connection_mode
+            data["device_port"] = self.device_port
+            data["intensity_setting"] = self.session_intensity
+            data["scheduled_trigger_times"] = list(self.session_trigger_times)
+            data["device_events"] = list(self.device_events)
+            data["verify_skipped"] = self.verify_skipped
+            data["verify_results"] = list(self.verify_results)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
         prefix = "suuvi" if self.mode == "suuvi" else "session"
@@ -2175,9 +2958,14 @@ class ChillsDemoApp(ctk.CTk):
             self._emergency_save()
         for t in self.trigger_timers:
             t.cancel()
+        # Make absolutely sure no Peltiers are still on before we tear down.
+        with contextlib.suppress(Exception):
+            if self.device.is_connected:
+                self.device.emergency_stop()
         with contextlib.suppress(Exception):
             self.arctop.stop()
-        self.ble.stop()
+        with contextlib.suppress(Exception):
+            self.device.stop()
         with contextlib.suppress(Exception):
             pygame.mixer.quit()
         self.destroy()
@@ -2186,6 +2974,13 @@ class ChillsDemoApp(ctk.CTk):
         if self.arctop.is_recording:
             with contextlib.suppress(Exception):
                 self.eeg_session_event_count = self.arctop.stop_recording()
+        # Stop any in-progress Peltier action and log it.
+        if self.mode == "frisson" and self.device.is_connected:
+            with contextlib.suppress(Exception):
+                self.device.emergency_stop()
+                self._log_device_event(
+                    event="emergency_stop", command="off", success=True,
+                    source="window-close")
         elapsed = (time.time() - self.playback_start) if self.playback_start else 0
         data = {
             "mode": self.mode,
@@ -2205,6 +3000,14 @@ class ChillsDemoApp(ctk.CTk):
             "eeg_event_count": self.eeg_session_event_count,
             "note": "Session interrupted — partial data",
         }
+        if self.mode == "frisson":
+            data["connection_mode"] = self.connection_mode
+            data["device_port"] = self.device_port
+            data["intensity_setting"] = self.session_intensity
+            data["scheduled_trigger_times"] = list(self.session_trigger_times)
+            data["device_events"] = list(self.device_events)
+            data["verify_skipped"] = self.verify_skipped
+            data["verify_results"] = list(self.verify_results)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
         fname = f"PARTIAL_{now}_P{self.participant_number:03d}_{self.current_song}.json"
         with contextlib.suppress(Exception):

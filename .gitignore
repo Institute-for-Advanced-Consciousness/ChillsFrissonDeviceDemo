@@ -5,3 +5,4 @@ __pycache__/
 Data/
 Stimuli/*.mp3
 Stimuli/*.wav
+track_overrides.json
