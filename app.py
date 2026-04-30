@@ -1518,24 +1518,24 @@ class ChillsDemoApp(ctk.CTk):
     _COOLDOWN_SINGLE = 30
     _COOLDOWN_WAVE = 60
 
+    # Each check that has fireable buttons exposes a Med / Max intensity
+    # picker. (Verification doesn't bother with low/high — the demo only
+    # needs to confirm the two production-relevant levels work.)
     _VERIFY_CHECKS = [
-        {"id": "ch_low",  "title": "1. Single channels — LOW intensity",
-         "kind": "single", "intensity": "low",
-         "instr": "Touch each Peltier's labeled (cold) side as you fire it. "
-                  "Confirm each one feels distinctly cool. "
-                  "30 s cooldown between fires for heatsink recovery."},
-        {"id": "ch_med",  "title": "2. Single channels — MED intensity",
-         "kind": "single", "intensity": "med",
-         "instr": "Repeat the touch test at MED intensity. "
-                  "Confirm intensity is uniform across all three channels."},
-        {"id": "wave",    "title": "3. Wave pattern (low intensity)",
-         "kind": "wave", "intensity": "low",
-         "instr": "Place three fingers across all three Peltiers. "
-                  "Confirm the rolling sensation propagates correctly. "
-                  "60 s cooldown after firing."},
-        {"id": "estop",   "title": "4. Emergency stop test",
-         "kind": "estop", "intensity": "low",
-         "instr": "Fires wave-low, then sends 'off' after 500 ms. "
+        {"id": "channels", "title": "1. Single channels",
+         "kind": "single", "intensities": ("med", "max"), "default": "med",
+         "instr": "Pick an intensity, then fire each Peltier and touch its "
+                  "labeled (cold) side. Confirm each feels distinctly cool "
+                  "and the level is uniform across channels. 30 s cooldown "
+                  "between fires for heatsink recovery."},
+        {"id": "wave",     "title": "2. Wave pattern",
+         "kind": "wave", "intensities": ("med", "max"), "default": "med",
+         "instr": "Pick an intensity, then place three fingers across all "
+                  "three Peltiers and confirm the rolling sensation "
+                  "propagates correctly. 60 s cooldown after firing."},
+        {"id": "estop",    "title": "3. Emergency stop test",
+         "kind": "estop", "intensities": ("med",), "default": "med",
+         "instr": "Fires wave-med, then sends 'off' after 500 ms. "
                   "Confirm the wave is interrupted before completing."},
     ]
 
@@ -1545,6 +1545,7 @@ class ChillsDemoApp(ctk.CTk):
         self._verify_state = {c["id"]: "pending" for c in self._VERIFY_CHECKS}
         self._verify_cooldown_until = 0.0
         self._verify_buttons: list = []  # buttons disabled during cooldown
+        self._verify_intensity_vars = {}  # rebuilt by _build_verify_check_card
 
         ctk.CTkLabel(self.page_frame, text="Verify Device",
                      font=("Helvetica", 30, "bold")).pack(pady=(20, 6))
@@ -1594,6 +1595,24 @@ class ChillsDemoApp(ctk.CTk):
                      text_color=C_MUTED, wraplength=720, justify="left",
                      anchor="w").pack(fill="x", padx=14, pady=(0, 6))
 
+        # Per-card intensity picker — only when the check has more than one
+        # option. Stored on self._verify_intensity_vars[check_id].
+        intensities = check.get("intensities", (check.get("default", "med"),))
+        var = ctk.StringVar(value=check.get("default", intensities[0]))
+        if not hasattr(self, "_verify_intensity_vars"):
+            self._verify_intensity_vars = {}
+        self._verify_intensity_vars[check["id"]] = var
+        if len(intensities) > 1:
+            int_row = ctk.CTkFrame(card, fg_color="transparent")
+            int_row.pack(fill="x", padx=14, pady=(0, 6))
+            ctk.CTkLabel(int_row, text="Intensity:",
+                         font=("Helvetica", 12), text_color=C_MUTED
+                         ).pack(side="left", padx=(0, 8))
+            ctk.CTkSegmentedButton(
+                int_row, values=list(intensities), variable=var,
+                font=("Helvetica", 12), width=160
+            ).pack(side="left")
+
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(2, 10))
 
@@ -1610,7 +1629,7 @@ class ChillsDemoApp(ctk.CTk):
                 self._verify_buttons.append(btn)
         elif check["kind"] == "wave":
             btn = ctk.CTkButton(
-                row, text="Fire Wave (low)", width=180, height=32,
+                row, text="Fire Wave", width=160, height=32,
                 font=("Helvetica", 13, "bold"),
                 fg_color=C_ACCENT, hover_color="#1a4a7a")
             btn.configure(command=lambda ck=check, b=btn: self._fire_verify(ck, b))
@@ -1627,21 +1646,30 @@ class ChillsDemoApp(ctk.CTk):
             self._verify_buttons.append(btn)
 
         # Pass / Fail / Skip toggles.
-        var = ctk.StringVar(value="pending")
+        result_var = ctk.StringVar(value="pending")
         seg = ctk.CTkSegmentedButton(
             row, values=["pending", "pass", "fail", "skip"],
-            variable=var, width=300, font=("Helvetica", 11),
+            variable=result_var, width=300, font=("Helvetica", 11),
             command=lambda v, cid=check["id"]: self._on_verify_mark(cid, v))
         seg.pack(side="right", padx=4)
+
+    def _verify_intensity_for(self, check: dict) -> str:
+        var = self._verify_intensity_vars.get(check["id"])
+        if var is None:
+            return check.get("default", "med")
+        v = var.get()
+        return v if v in INTENSITY_LEVELS else check.get("default", "med")
 
     def _fire_verify(self, check: dict, btn, channel: int | None = None):
         if not self._verify_can_fire():
             return
-        intensity = check["intensity"]
+        intensity = self._verify_intensity_for(check)
         if channel is not None:
-            ok, msg = self._do_fire(channel=channel, intensity=intensity)
+            ok, msg = self._do_fire(
+                channel=channel, intensity=intensity, source="verify")
         else:
-            ok, msg = self._do_fire(pattern="wave", intensity=intensity)
+            ok, msg = self._do_fire(
+                pattern="wave", intensity=intensity, source="verify")
         cooldown = (self._COOLDOWN_WAVE if check["kind"] == "wave"
                     else self._COOLDOWN_SINGLE)
         self._begin_verify_cooldown(cooldown)
@@ -1652,7 +1680,9 @@ class ChillsDemoApp(ctk.CTk):
     def _fire_verify_estop(self, check: dict, btn):
         if not self._verify_can_fire():
             return
-        ok, _ = self._do_fire(pattern="wave", intensity="low")
+        intensity = self._verify_intensity_for(check)
+        ok, _ = self._do_fire(
+            pattern="wave", intensity=intensity, source="verify")
         if not ok:
             return
         self.after(500, lambda: self._emergency_stop(source="verify-test"))
