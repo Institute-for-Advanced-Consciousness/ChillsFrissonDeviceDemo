@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 _missing = []
 try:
     import customtkinter as ctk
+    import tkinter as tk
 except ImportError:
     _missing.append("customtkinter")
 try:
@@ -925,10 +926,43 @@ class ChillsDemoApp(ctk.CTk):
         self._mode_toggle.grid_remove()
 
         # ── layout: page area + status bar ───────────────────────────
-        # Scrollable so taller pages (e.g. Suuvi setup with EEG card) can be
-        # reached without resizing the window.
-        self.page_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.page_frame.grid(row=1, column=0, sticky="nsew", padx=30, pady=(10, 5))
+        # Hand-rolled scroll container instead of CTkScrollableFrame —
+        # CTk's variant binds <MouseWheel> via bind_all on Enter/Leave,
+        # which doesn't fire reliably on macOS when the cursor moves
+        # between sibling children. Owning the canvas directly means
+        # our wheel handler has no competitor.
+        scroll_host = ctk.CTkFrame(self, fg_color="transparent")
+        scroll_host.grid(row=1, column=0, sticky="nsew", padx=30, pady=(10, 5))
+        scroll_host.grid_rowconfigure(0, weight=1)
+        scroll_host.grid_columnconfigure(0, weight=1)
+
+        # Background colour matched to the CTk dark theme.
+        canvas_bg = "#1a1a1a"
+        self._page_canvas = tk.Canvas(
+            scroll_host, highlightthickness=0, borderwidth=0, bg=canvas_bg)
+        self._page_canvas.grid(row=0, column=0, sticky="nsew")
+        page_scrollbar = ctk.CTkScrollbar(
+            scroll_host, command=self._page_canvas.yview)
+        page_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._page_canvas.configure(yscrollcommand=page_scrollbar.set)
+
+        # The inner frame is what the rest of the app packs into. Keeping
+        # the attribute name `page_frame` means every existing call site
+        # (and `_clear_page → page_frame.winfo_children()`) stays correct.
+        self.page_frame = ctk.CTkFrame(
+            self._page_canvas, fg_color="transparent")
+        self._page_window = self._page_canvas.create_window(
+            (0, 0), window=self.page_frame, anchor="nw")
+        # Update the scrollregion as the inner frame grows/shrinks.
+        self.page_frame.bind(
+            "<Configure>",
+            lambda _e: self._page_canvas.configure(
+                scrollregion=self._page_canvas.bbox("all")))
+        # Stretch the inner frame to the canvas width as it resizes.
+        self._page_canvas.bind(
+            "<Configure>",
+            lambda e: self._page_canvas.itemconfigure(
+                self._page_window, width=e.width))
 
         self.status_bar = ctk.CTkFrame(self, height=44, corner_radius=0)
         self.status_bar.grid(row=2, column=0, sticky="ew")
@@ -943,10 +977,19 @@ class ChillsDemoApp(ctk.CTk):
         # ── participant counter ──────────────────────────────────────
         self.participant_number = self._next_participant_number()
 
-        # ── mousewheel scroll for the page area (macOS-friendly) ─────
-        self.bind_all("<MouseWheel>", self._on_global_mousewheel)
-        self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux up
-        self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux down
+        # ── page scroll: wheel + keyboard fallback ───────────────────
+        # Wheel bindings (work on real mice and on python.org Python's Tk;
+        # do NOT work on Homebrew Python's Tk for two-finger trackpad).
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._page_canvas.bind(ev, self._on_global_mousewheel, add="+")
+            self.bind_all(ev, self._on_global_mousewheel)
+            for cls in ("Frame", "Label", "Button", "Canvas", "Toplevel",
+                        "Radiobutton", "Checkbutton", "Entry", "Scale",
+                        "TFrame", "TLabel", "TButton"):
+                self.bind_class(cls, ev, self._on_global_mousewheel, add="+")
+        # Keyboard scroll fallback — always works, regardless of Tk build.
+        for key in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>", "<End>"):
+            self.bind_all(key, self._on_scroll_key)
 
         # ── global emergency stop (Frisson mode only) ────────────────
         # Spacebar is deliberate: it's the most likely accidental keystroke
@@ -959,12 +1002,15 @@ class ChillsDemoApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_global_mousewheel(self, event):
-        """Forward wheel events to the scrollable page canvas.
+        """Forward wheel events to the page-area canvas.
 
-        Skips events whose target is a Text/Listbox widget so the URL
-        textbox keeps its own internal scroll behavior.
+        Note: on Homebrew Python's bundled Tcl/Tk, two-finger trackpad
+        scrolls don't generate <MouseWheel> events at all (verified by
+        diagnostic logging — zero events reach Tk). The keyboard-scroll
+        fallback below is the workaround. python.org's installer Python
+        bundles a Tk build that handles trackpad scroll natively.
         """
-        canvas = getattr(self.page_frame, "_parent_canvas", None)
+        canvas = getattr(self, "_page_canvas", None)
         if canvas is None:
             return
         w = event.widget
@@ -986,6 +1032,36 @@ class ChillsDemoApp(ctk.CTk):
         if delta:
             with contextlib.suppress(Exception):
                 canvas.yview_scroll(delta, "units")
+
+    # ── Keyboard scroll fallback ──────────────────────────────────────
+    # Trackpad scroll doesn't work on Homebrew Python's Tcl/Tk; arrow
+    # keys + PageUp/Down + Home/End give the operator a usable
+    # alternative on every page. Ignored when typing into Entry/Text.
+
+    def _on_scroll_key(self, event):
+        canvas = getattr(self, "_page_canvas", None)
+        if canvas is None:
+            return
+        # Don't hijack arrows/page keys when typing in a text field.
+        try:
+            wcls = event.widget.winfo_class()
+        except Exception:
+            wcls = ""
+        if wcls in ("Entry", "Text", "TEntry", "TText", "Spinbox"):
+            return
+        key = event.keysym
+        if key == "Up":
+            canvas.yview_scroll(-3, "units")
+        elif key == "Down":
+            canvas.yview_scroll(3, "units")
+        elif key == "Prior":   # Page Up
+            canvas.yview_scroll(-1, "pages")
+        elif key == "Next":    # Page Down
+            canvas.yview_scroll(1, "pages")
+        elif key == "Home":
+            canvas.yview_moveto(0.0)
+        elif key == "End":
+            canvas.yview_moveto(1.0)
 
     # ── safety hooks ─────────────────────────────────────────────────
 
@@ -1484,6 +1560,8 @@ class ChillsDemoApp(ctk.CTk):
 
     def _connect_done(self, result):
         ok, msg = result
+        if not (hasattr(self, "_connect_btn") and self._connect_btn.winfo_exists()):
+            return  # user navigated away before the worker returned
         if ok:
             self._connect_btn.configure(text="Connected", fg_color=C_SUCCESS)
             self._conn_status.configure(
@@ -1491,8 +1569,12 @@ class ChillsDemoApp(ctk.CTk):
         else:
             self._connect_btn.configure(text="Retry", fg_color=C_DANGER)
             self._conn_status.configure(text=msg, text_color=C_DANGER)
-        self.after(2000, lambda: self._connect_btn.configure(
-            text="Connect", fg_color=C_ACCENT))
+
+        def _restore_btn():
+            if hasattr(self, "_connect_btn") and self._connect_btn.winfo_exists():
+                with contextlib.suppress(Exception):
+                    self._connect_btn.configure(text="Connect", fg_color=C_ACCENT)
+        self.after(2000, _restore_btn)
 
     def _on_disconnect(self):
         self._worker(self.device.disconnect, lambda _: self._conn_status.configure(
